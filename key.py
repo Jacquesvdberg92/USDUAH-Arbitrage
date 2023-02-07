@@ -1,2 +1,3 @@
 api_key = '4H9wTYi88FzI0gFws8wC7J292E0WkR2QmpusohTUhYEcZEQQ9CT9bsawSn7mFyQR'
 api_secret = 'w9GeeKo8p9mtAZUxkYqwPeGYE4yatpEJfCDFtOqxaSt3CDrFrWC0dzh2uQSDYH88'
+loop = 'true'
