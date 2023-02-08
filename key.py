@@ -1,3 +1,5 @@
-api_key = '4H9wTYi88FzI0gFws8wC7J292E0WkR2QmpusohTUhYEcZEQQ9CT9bsawSn7mFyQR'
-api_secret = 'w9GeeKo8p9mtAZUxkYqwPeGYE4yatpEJfCDFtOqxaSt3CDrFrWC0dzh2uQSDYH88'
+api_key = 'KrF4vDSHzotp62FJgBkDd9cy7lMIoUT60esY5JftORQAzvZdh0aoABlI6ml7W98M'
+api_secret = 'ys5ojwuVSCJDvwJMsuS0CN0jLkalL5JhDDZLNFWMBGkzaI50omHUcj7Y6WrKQOr7'
 loop = 'true'
+size = 100
+diff = 0.11
