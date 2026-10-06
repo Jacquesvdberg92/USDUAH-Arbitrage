@@ -91,10 +91,24 @@ python -m arbitrage_bot --once
 cp config.example.json config.json      # optional: edit settings
 python -m arbitrage_bot
 
+# ...with a live dashboard in your browser
+python -m arbitrage_bot --ui
+
 # Real money - only after paper trading shows a real edge
 export BINANCE_API_KEY=... BINANCE_API_SECRET=...
 python -m arbitrage_bot --mode live --confirm-live
 ```
+
+**Dashboard (`--ui`).** This opens http://127.0.0.1:8765/ in your browser and shows what the bot is doing, live:
+- every cycle's current edge against your threshold
+- the best edge over time
+- P&L, trades and how close each risk limit is
+- the activity log
+
+It has three buttons: **Pause trading** (keep watching, place no orders), **Resume** and **Stop** (finish the current cycle, then stop).
+- It only listens on your own machine, and nothing on it can place an order or change a setting.
+- When the bot stops, the page stays up so you can see why; press Ctrl+C to exit.
+- Use `--ui-port` to change the port and `--no-browser` to skip opening a tab.
 
 With live keys set, paper mode also reads your account's real taker fee for each symbol
 (read-only), so paper results reflect your fee tier.

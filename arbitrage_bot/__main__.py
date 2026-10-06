@@ -6,6 +6,8 @@ import argparse
 import logging
 import os
 import sys
+import time
+import webbrowser
 from decimal import Decimal
 from typing import Dict, List, Optional
 
@@ -64,6 +66,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--once", action="store_true", help="print the current edge of every cycle and exit; never trades")
     parser.add_argument("--confirm-live", action="store_true", help="required to trade real money in live mode")
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging (every depth check)")
+    parser.add_argument("--ui", action="store_true", help="open a live dashboard in your browser (local only)")
+    parser.add_argument("--ui-port", type=int, default=8765, help="dashboard port (default 8765)")
+    parser.add_argument("--no-browser", action="store_true", help="with --ui: don't open a browser tab automatically")
     args = parser.parse_args(argv)
 
     config_path = args.config or ("config.json" if os.path.exists("config.json") else None)
@@ -128,8 +133,40 @@ def main(argv: Optional[List[str]] = None) -> int:
             log.error("can't write trade_log %r: %s", config.trade_log, err)
             return 1
 
+    dashboard = None
+    if args.ui:
+        from .dashboard import Dashboard, LogBuffer
+
+        buffer = LogBuffer()
+        logging.getLogger().addHandler(buffer)
+        try:
+            dashboard = Dashboard(bot, buffer, port=args.ui_port)
+        except FileNotFoundError as err:
+            log.error("the dashboard page is missing (%s) - re-download the bot", err)
+            return 1
+        except OSError as err:
+            log.error("can't start the dashboard on port %d (%s) - try --ui-port with another number", args.ui_port, err)
+            return 1
+        url = dashboard.start()
+        log.info("dashboard: %s", url)
+        if not args.no_browser:
+            try:
+                webbrowser.open(url)
+            except Exception as err:  # no browser available - the URL is in the log
+                log.debug("could not open a browser: %s", err)
+
     log.info("MODE: %s%s", config.mode.upper(), "  *** REAL MONEY ***" if config.mode == "live" else "")
-    return bot.run()
+    code = bot.run()
+    if dashboard is not None:
+        log.info("bot stopped - the dashboard stays up at %s so you can see why; press Ctrl+C to exit", dashboard.url)
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            dashboard.stop()
+    return code
 
 
 if __name__ == "__main__":
