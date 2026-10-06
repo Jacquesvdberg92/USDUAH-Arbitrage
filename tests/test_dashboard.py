@@ -32,7 +32,8 @@ def stub_page(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def served(config, paper, index, cycles, fees):
+def served(config, paper, index, cycles, fees, caplog):
+    caplog.set_level(logging.INFO)  # as setup_logging does in the real program
     bot = make_bot(config, paper, index, cycles, fees)
     buffer = LogBuffer()
     logging.getLogger().addHandler(buffer)
