@@ -1,5 +1,6 @@
 import http.client
 import json
+import pathlib
 import logging
 import threading
 import time
@@ -147,3 +148,13 @@ def test_cli_ui_flag(tmp_path, monkeypatch):
     monkeypatch.setattr(cli.time, "sleep", stop_waiting)
     assert cli.main(["--ui", "--ui-port", "0"]) == 0
     assert opened and opened[0].startswith("http://127.0.0.1:")
+
+
+def test_real_page_is_self_contained_and_uses_the_control_header():
+    import re
+
+    import arbitrage_bot
+
+    html = (pathlib.Path(arbitrage_bot.__file__).parent / "dashboard.html").read_text()
+    assert not re.search(r"""(src|href)\s*=\s*["']https?://""", html)  # works offline, no CDNs
+    assert "X-Arb-Dashboard" in html and "/api/state" in html
