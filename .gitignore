@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Your settings and secrets - never commit API keys.
+config.json
+.env
+
+# Runtime output
+arbitrage.log
+trades.jsonl
+log.txt
