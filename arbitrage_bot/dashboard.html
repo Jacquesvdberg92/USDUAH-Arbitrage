@@ -22,6 +22,8 @@
   --accent: #2a78d6;
   --accent-soft: #dbe8f8;
   --accent-ink: #1c5cab;
+  --accent-fill: #1f63b8;
+  --accent-fill-hover: #1a5399;
   --good: #0ca30c;
   --good-ink: #006300;
   --good-wash: rgba(12, 163, 12, .09);
@@ -55,6 +57,8 @@
     --accent: #3987e5;
     --accent-soft: #1b3150;
     --accent-ink: #8cbcf2;
+    --accent-fill: #2a6fc9;
+    --accent-fill-hover: #2462b3;
     --good: #19b319;
     --good-ink: #4fd04f;
     --good-wash: rgba(25, 179, 25, .13);
@@ -85,18 +89,26 @@ button { font: inherit; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 .wrap { max-width: 1480px; margin: 0 auto; padding: 0 24px; }
 
-/* ---------- live band ---------- */
+/* ---------- sticky top bar (live band + header) ---------- */
+.topbar { position: sticky; top: 0; z-index: 10; display: flex; flex-direction: column; }
 .liveband {
   background: var(--live); color: var(--on-live);
   font-weight: 700; letter-spacing: .06em; text-transform: uppercase; font-size: 12px;
   text-align: center; padding: 6px 16px;
   background-image: repeating-linear-gradient(135deg, rgba(255,255,255,.10) 0 10px, transparent 10px 20px);
 }
+.liveband .lb-short { display: none; }
+/* live mode: a red frame around the whole window, whatever is scrolled into view */
+body.is-live::after {
+  content: ""; position: fixed; inset: 0; z-index: 30; pointer-events: none;
+  box-shadow: inset 0 0 0 3px var(--live);
+}
 
 /* ---------- header ---------- */
 header.top {
   background: var(--card);
   border-bottom: 1px solid var(--line);
+  box-shadow: 0 1px 6px rgba(0, 0, 0, .05);
 }
 body.is-live header.top { border-bottom: 2px solid var(--live); }
 .top-inner {
@@ -137,6 +149,8 @@ body.is-live header.top { border-bottom: 2px solid var(--live); }
 .status.stopped .dot { background: var(--muted); border-radius: 2px; }
 .status.stopped.fatal .dot { background: var(--bad); }
 .status.offline .dot { background: transparent; box-shadow: inset 0 0 0 2px var(--bad); }
+.status.stale .dot { background: var(--warn); color: var(--warn); }
+.status.stale #status-text { color: var(--warn-ink); }
 .dot.beat::after { animation: beat 1s ease-out; }
 @keyframes beat { 0% { opacity: .55; transform: scale(.6); } 100% { opacity: 0; transform: scale(1.5); } }
 .status.stopping .dot { animation: blink 1s steps(2, start) infinite; }
@@ -157,15 +171,22 @@ body.is-live header.top { border-bottom: 2px solid var(--live); }
 .btn:hover:not(:disabled) { background: var(--hover); }
 .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .btn:disabled { opacity: .45; cursor: not-allowed; }
-.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-.btn.primary:hover:not(:disabled) { background: var(--accent-ink); }
+.btn.primary { background: var(--accent-fill); border-color: var(--accent-fill); color: #fff; }
+.btn.primary:hover:not(:disabled) { background: var(--accent-fill-hover); }
 .btn.danger { color: var(--bad-ink); border-color: color-mix(in srgb, var(--bad) 45%, transparent); }
 .btn.danger:hover:not(:disabled) { background: var(--bad-wash); }
 .btn svg { flex: none; }
 .ctl-error {
   margin: 0 auto 10px; max-width: 1480px; padding: 0 24px;
+  display: flex; align-items: center; gap: 10px;
   color: var(--bad-ink); font-size: 13px; font-weight: 600;
 }
+.ctl-error .x {
+  flex: none; width: 24px; height: 24px; border-radius: 6px; border: 1px solid var(--line-2);
+  background: var(--card); color: var(--ink-2); cursor: pointer; font-size: 15px; line-height: 1; padding: 0;
+}
+.ctl-error .x:hover { background: var(--hover); }
+.ctl-error .x:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 /* ---------- banners ---------- */
 .banner {
@@ -190,8 +211,8 @@ body.is-live header.top { border-bottom: 2px solid var(--live); }
 
 /* ---------- "doing now" strip ---------- */
 .now {
-  display: flex; align-items: center; gap: 10px 24px; flex-wrap: wrap;
-  margin-top: 16px; padding: 12px 18px;
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 6px 24px;
+  margin-top: 16px; padding: 11px 18px;
   background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
   border-left: 4px solid var(--accent);
 }
@@ -199,15 +220,19 @@ body.is-live header.top { border-bottom: 2px solid var(--live); }
 .now.tone-warn { border-left-color: var(--warn); }
 .now.tone-bad { border-left-color: var(--bad); }
 .now.tone-muted { border-left-color: var(--axis); }
-.now-text { font-size: 15px; font-weight: 550; flex: 1 1 420px; min-width: 0; overflow-wrap: anywhere; }
-.now-text .path { font-weight: 600; }
-.now-side { color: var(--muted); font-size: 13px; }
+.now-text { min-width: 0; }
+/* a fixed two-line block (headline + detail) so the page never jumps when the message changes */
+.now-h, .now-d { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.now-h { font-size: 15px; font-weight: 650; line-height: 1.4; }
+.now-d { font-size: 13.5px; color: var(--ink-2); line-height: 1.45; margin-top: 1px; }
+.now-d .path { font-weight: 600; color: var(--ink); }
+.now-side { color: var(--muted); font-size: 13px; white-space: nowrap; }
 .now-side .pos, .now-side .neg { font-weight: 600; }
 
 /* ---------- KPIs ---------- */
 .kpis {
   display: grid; gap: 12px; margin-top: 16px;
-  grid-template-columns: 1.35fr repeat(4, minmax(0, 1fr)) 1.25fr;
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr) minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.25fr);
 }
 .kpi {
   background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
@@ -232,7 +257,7 @@ body.is-live header.top { border-bottom: 2px solid var(--live); }
 /* ---------- cards & grid ---------- */
 .grid {
   display: grid; gap: 16px; margin: 16px 0 24px;
-  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  grid-template-columns: minmax(0, 1.9fr) minmax(0, 1fr);
   align-items: start;
 }
 .side { display: grid; gap: 16px; min-width: 0; }
@@ -247,8 +272,8 @@ body.is-live header.top { border-bottom: 2px solid var(--live); }
 .card-head h2 { margin: 0; font-size: 15px; font-weight: 650; }
 .card-head .sub { color: var(--muted); font-size: 12.5px; }
 .card-head .right { margin-left: auto; color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.card-head .card-note { flex-basis: 100%; margin: 2px 0 0; color: var(--ink-2); font-size: 12.5px; line-height: 1.45; }
 .card-foot { padding: 8px 16px 12px; color: var(--muted); font-size: 12px; }
-.opp-home-note { display: none; }
 
 /* ---------- tables ---------- */
 .tscroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
@@ -274,13 +299,23 @@ th:last-child, td:last-child { padding-right: 16px; }
 .path .ar { color: var(--muted); margin-left: .3em; font-weight: 400; }
 
 /* opportunities */
-#opp col.c-edge { width: 72px; }
-#opp col.c-bar { width: 150px; }
-#opp col.c-best { width: 60px; }
-#opp col.c-fees { width: 52px; }
-#opp col.c-check { width: 218px; }
+#opp th, #opp td { padding-left: 8px; padding-right: 8px; }
+#opp th:first-child, #opp td:first-child { padding-left: 16px; }
+#opp th:last-child, #opp td:last-child { padding-right: 16px; }
+#opp col.c-edge { width: 76px; }
+#opp col.c-bar { width: 200px; }
+#opp col.c-best { width: 54px; }
+#opp col.c-fees { width: 46px; }
+#opp col.c-check { width: 278px; }
+#opp td.r { text-overflow: clip; }
 #opp td.path-cell { white-space: normal; }
-#opp .sub-line { display: none; }
+#opp .pw { container-type: inline-size; }
+#opp .pw .path { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* when the full loop doesn't fit, drop the closing "→ USDT" (the note above says every loop ends there) */
+@container (max-width: 214px) {
+  .pw .tok:last-child, .pw .tok:nth-last-child(2) .ar { display: none; }
+}
+#opp .sub-line, #opp .bar-m, #opp .scale-m { display: none; }
 #opp tr.hot td { background: var(--good-wash); }
 #opp tr.hot td:first-child { box-shadow: inset 4px 0 0 var(--good); }
 #opp tr.hot .edge-v { color: var(--good-ink); font-weight: 700; }
@@ -290,14 +325,21 @@ th:last-child, td:last-child { padding-right: 16px; }
 .bar .zero-l { position: absolute; top: -3px; bottom: -3px; width: 1px; background: var(--axis); }
 .bar .fill { position: absolute; top: 2px; bottom: 2px; background: var(--neg-bar); }
 .bar .fill.neg { border-radius: 3px 0 0 3px; }
+.bar .fill.neg.clip { border-radius: 0; background: linear-gradient(to right, transparent, var(--neg-bar) 12px); }
 .bar .fill.pos { border-radius: 0 3px 3px 0; background: var(--warn); }
 .bar .fill.hot { background: var(--good); }
-.bar .thr { position: absolute; top: -4px; bottom: -4px; width: 2px; margin-left: -1px; background: var(--good-ink); border-radius: 1px; }
+/* the trade threshold: dashed, like the threshold line in the chart */
+.bar .thr, .legend-line .sw.thr {
+  background: repeating-linear-gradient(to bottom, var(--good-ink) 0 3px, transparent 3px 5px);
+}
+.bar .thr { position: absolute; top: -5px; bottom: -5px; width: 2px; margin-left: -1px; }
 .bar .nodata { position: absolute; inset: 0; font-size: 11.5px; color: var(--muted); line-height: 14px; white-space: nowrap; overflow: hidden; }
 .scale { position: relative; height: 14px; font-size: 10.5px; font-weight: 600; color: var(--muted); letter-spacing: 0; text-transform: none; }
-.scale span { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; }
-.scale span.lo { transform: none; left: 0; }
-.scale span.hi { transform: translateX(-100%); left: 100%; }
+.scale span { position: absolute; top: 0; white-space: nowrap; }
+.scale .lo { left: 0; }
+.scale .zl { transform: translateX(calc(-100% - 4px)); }
+.scale .tl { color: var(--good-ink); font-weight: 700; transform: translateX(4px); }
+.scale .hi { transform: translateX(-100%); left: 100%; }
 .chip {
   display: inline-flex; align-items: center; gap: 4px;
   font-size: 11.5px; font-weight: 650; border-radius: 6px; padding: 1px 7px;
@@ -307,11 +349,18 @@ th:last-child, td:last-child { padding-right: 16px; }
 .chip.warn { background: var(--warn-wash); color: var(--warn-ink); border-color: transparent; }
 .chip.bad { background: var(--bad-wash); color: var(--bad-ink); border-color: color-mix(in srgb, var(--bad) 35%, transparent); }
 .chip.quiet { background: transparent; color: var(--muted); }
+.check-cell .chip { margin-right: 5px; padding: 0 6px; }
+#opp td.c-best, #opp td.c-fees { font-size: 12.5px; }
+.check-cell .small { font-size: 11.5px; }
 .check-cell .lc-main { font-weight: 600; }
 .legend-line { display: flex; flex-wrap: wrap; gap: 4px 16px; align-items: center; }
 .legend-line .k { display: inline-flex; align-items: center; gap: 6px; }
 .legend-line .sw { width: 14px; height: 8px; border-radius: 2px; display: inline-block; }
-.legend-line .sw.thr { width: 2px; height: 12px; background: var(--good-ink); border-radius: 1px; }
+.legend-line .sw.thr { width: 2px; height: 13px; border-radius: 0; }
+
+/* stopped: the prices are the last ones before the stop - show them as history, not as live */
+.frozen-able { transition: opacity .3s; }
+body.is-stopped .frozen-able { opacity: .6; }
 
 /* chart */
 .chart-wrap { position: relative; padding: 0 8px 8px; }
@@ -379,6 +428,7 @@ th:last-child, td:last-child { padding-right: 16px; }
 .log-box { position: relative; }
 .log {
   height: 440px; overflow-y: auto; overflow-x: hidden;
+  overflow-anchor: none;   /* scroll position is kept by hand when old lines are trimmed */
   font: 12px/1.5 var(--mono); padding: 4px 0 8px;
   border-top: 1px solid var(--line); background: var(--sunk);
   border-radius: 0 0 var(--radius) var(--radius);
@@ -398,8 +448,10 @@ th:last-child, td:last-child { padding-right: 16px; }
 .jump {
   position: absolute; right: 18px; bottom: 14px; z-index: 2;
   border-radius: 999px; padding: 5px 12px; font-size: 12px; font-weight: 650; cursor: pointer;
-  background: var(--accent); color: #fff; border: 0; box-shadow: 0 2px 10px rgba(0,0,0,.18);
+  background: var(--accent-fill); color: #fff; border: 0; box-shadow: 0 2px 10px rgba(0,0,0,.18);
 }
+.jump:hover { background: var(--accent-fill-hover); }
+.jump:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 /* stale data (disconnected) */
 .stale-able { transition: opacity .3s; }
@@ -410,12 +462,36 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
 /* ---------- responsive ---------- */
 @media (max-width: 1360px) {
   #opp col.c-fees, #opp .c-fees { display: none; }
+  #opp col.c-bar { width: 180px; }
   #trades col.c-ms, #trades .t-ms { display: none; }
-  .grid { grid-template-columns: minmax(0, 1.75fr) minmax(0, 1fr); }
+  .grid { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
   .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
-@media (max-width: 1100px) {
+@media (max-width: 1240px) {
   .grid { grid-template-columns: minmax(0, 1fr); }
+  .side { grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); }
+}
+@media (max-width: 1100px) {
+  .now { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 900px) {
+  #opp col.c-best, #opp .c-best { display: none; }
+  .side { grid-template-columns: minmax(0, 1fr); }
+}
+/* narrower: the bar moves under the cycle name and the depth check becomes a sub-line */
+@media (max-width: 860px) {
+  #opp col.c-bar, #opp .c-bar, #opp col.c-check, #opp .c-check { display: none; }
+  #opp col.c-edge { width: 84px; }
+  #opp .bar-m { display: block; height: 10px; margin: 7px 0 3px; }
+  #opp .scale-m { display: block; margin-top: 5px; }
+  #opp .sub-line { display: block; font-size: 11.5px; line-height: 1.5; color: var(--muted); margin-top: 3px; }
+  #opp th { vertical-align: top; }
+  #opp th:first-child, #opp td:first-child { padding-left: 12px; }
+  #opp td.r, #opp th.r { padding-right: 12px; }
+  #opp td.path-cell { padding-top: 8px; padding-bottom: 8px; line-height: 1.3; }
+  #opp td { vertical-align: top; }
+  #opp td.r { padding-top: 8px; line-height: 1.3; }
+  #opp .sub-line .chip { font-size: 10.5px; padding: 0 5px; margin-right: 4px; }
 }
 @media (max-width: 820px) {
   .statusbox { margin-left: 0; }
@@ -423,7 +499,7 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
 @media (max-width: 680px) {
   .wrap { padding: 0 16px; }
   .ctl-error { padding: 0 16px; }
-  .top-inner { gap: 10px 16px; }
+  .top-inner { gap: 10px 16px; padding-top: 10px; padding-bottom: 10px; }
   .brand { width: 100%; }
   .brand .mode { margin-left: auto; }
   .statusbox { width: 100%; gap: 6px 14px; }
@@ -434,20 +510,19 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
   .kpi { padding: 10px 12px 11px; }
   .kpi-value { font-size: 20px; }
   .kpi-hero .kpi-value { font-size: 28px; }
-  .now { padding: 10px 14px; }
-  .now-text { font-size: 14px; flex-basis: 100%; }
-  #opp col.c-best, #opp col.c-check, #opp .c-best, #opp .c-check { display: none; }
-  #opp col.c-edge { width: 62px; }
-  #opp col.c-bar { width: 84px; }
-  #opp .sub-line { display: block; font-size: 11.5px; color: var(--muted); margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  #opp td.path-cell { padding-top: 6px; padding-bottom: 6px; line-height: 1.3; }
-  #opp td { height: 44px; }
-  #opp .pw .tok:last-child, #opp .pw .tok:nth-last-child(2) .ar { display: none; }
-  .opp-home-note { display: inline; }
+  /* the band sits under the header here, so it stays in the part of the header that sticks */
+  .liveband { order: 2; padding: 4px 12px; }
+  .liveband .lb-long { display: none; }
+  .liveband .lb-short { display: inline; }
+  .now { grid-template-columns: minmax(0, 1fr); padding: 10px 14px; }
+  .now-h, .now-d { white-space: normal; overflow-wrap: anywhere; }
+  .now-h { font-size: 14.5px; }
+  .now-d { font-size: 13px; }
+  /* room for a two-line headline and a two-line detail, so the page doesn't jump as messages change */
+  .now-text { min-height: calc(2 * 1.4 * 14.5px + 2 * 1.45 * 13px + 1px); }
   .trades-scroll { max-height: none; overflow: visible; }
   th:first-child, td:first-child { padding-left: 12px; }
   th:last-child, td:last-child { padding-right: 12px; }
-  .trades-scroll { max-height: 560px; }
   #trades, #trades tbody { display: block; min-width: 0; }
   #trades colgroup, #trades thead { display: none; }
   #trades tr { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 5px 10px; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--line); }
@@ -479,7 +554,8 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
 </style>
 </head>
 <body>
-<div id="liveband" class="liveband" hidden>Live mode &middot; real money &middot; orders go to your Binance account</div>
+<div class="topbar" id="topbar">
+<div id="liveband" class="liveband" hidden><span class="lb-long">Live mode &middot; real money &middot; orders go to your Binance account</span><span class="lb-short">Live &middot; real money</span></div>
 
 <header class="top">
   <div class="wrap top-inner">
@@ -497,10 +573,10 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
       </div>
       <span id="mode" class="mode" title="Trading mode">&mdash;</span>
     </div>
-    <div class="statusbox">
+    <div class="statusbox" id="statusbox">
       <span id="status" class="status"><span class="dot" id="dot"></span><span id="status-text">Connecting&hellip;</span></span>
-      <span class="meta">Up <b id="uptime">&mdash;</b></span>
-      <span class="meta" id="age-wrap">Updated <b id="age">&mdash;</b></span>
+      <span class="meta"><span id="up-l">Up</span> <b id="uptime">&mdash;</b></span>
+      <span class="meta" id="age-wrap"><span id="age-l">Updated</span> <b id="age">&mdash;</b></span>
     </div>
     <div class="controls" role="group" aria-label="Bot controls">
       <button class="btn" id="btn-pause" type="button" title="Keep scanning and showing data, but place no orders">
@@ -514,8 +590,9 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
         <span id="stop-label">Stop bot</span></button>
     </div>
   </div>
-  <div id="ctl-error" class="ctl-error" role="alert" hidden></div>
+  <div id="ctl-error" class="ctl-error" role="alert" hidden><span id="ctl-error-text"></span><button type="button" class="x" id="ctl-error-x" aria-label="Dismiss this message" title="Dismiss">&times;</button></div>
 </header>
+</div>
 
 <main class="wrap">
   <div id="conn-banner" class="banner offline" role="alert" hidden>
@@ -538,7 +615,7 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
 
   <div class="stale-able">
     <section class="now" id="now" aria-label="What the bot is doing">
-      <div class="now-text" id="now-text">Connecting to the bot&hellip;</div>
+      <div class="now-text" id="now-text"><div class="now-h" id="now-h">Connecting to the bot&hellip;</div><div class="now-d" id="now-d">&nbsp;</div></div>
       <div class="now-side" id="now-side"></div>
     </section>
 
@@ -575,11 +652,12 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
     </section>
 
     <div class="grid">
-      <section class="card" aria-labelledby="opp-h">
+      <section class="card frozen-able" aria-labelledby="opp-h">
         <div class="card-head">
           <h2 id="opp-h">Opportunities</h2>
-          <span class="sub" id="opp-sub">every cycle the bot watches, best first<span class="opp-home-note" id="opp-home-note"></span></span>
+          <span class="sub" id="opp-sub">every cycle the bot watches, best first</span>
           <span class="right" id="opp-right"></span>
+          <p class="card-note" id="opp-note">Edge = what one loop would return after fees at the current best prices &middot; 1&nbsp;bps = 0.01% &middot; trades at the threshold or better</p>
         </div>
         <div class="tscroll">
           <table id="opp">
@@ -588,12 +666,12 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
             </colgroup>
             <thead>
               <tr>
-                <th scope="col">Cycle</th>
-                <th scope="col" class="r" title="Top-of-book return after fees, in basis points (1 bps = 0.01%). Positive = profitable.">Edge</th>
-                <th scope="col" aria-label="Edge scale"><div class="scale" id="opp-scale"></div></th>
+                <th scope="col">Cycle<div class="scale scale-m" id="opp-scale-m" aria-hidden="true"></div></th>
+                <th scope="col" class="r" title="Top-of-book return after fees, in basis points (1 bps = 0.01%). Positive = profitable. Rows are re-sorted every 5 s so they don't shuffle every second; a cycle that clears the threshold or jumps ahead by more than 2 bps moves at once.">Edge</th>
+                <th scope="col" class="c-bar" aria-label="Edge scale"><div class="scale" id="opp-scale"></div></th>
                 <th scope="col" class="r c-best" title="Best edge this cycle has shown since the bot started">Best</th>
                 <th scope="col" class="r c-fees" title="Taker fees for the three legs, in bps">Fees</th>
-                <th scope="col" class="c-check" title="Result of the last full order-book check (depth, fees and lot-size rounding included)">Last depth check</th>
+                <th scope="col" class="c-check" title="Result of the last full order-book check (depth, fees and lot-size rounding included). The bot only runs it for cycles that clear the threshold at the top of the book.">Last depth check</th>
               </tr>
             </thead>
             <tbody id="opp-body"></tbody>
@@ -603,12 +681,12 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
           <span class="k"><span class="sw thr" aria-hidden="true"></span><span id="leg-thr">trade threshold</span></span>
           <span class="k"><span class="sw" style="background:var(--neg-bar)" aria-hidden="true"></span>loses money</span>
           <span class="k"><span class="sw" style="background:var(--warn)" aria-hidden="true"></span>positive, below threshold</span>
-          <span class="k"><span class="sw" style="background:var(--good)" aria-hidden="true"></span>&#9650; clears threshold &rarr; depth check</span>
+          <span class="k"><span class="sw" style="background:var(--good)" aria-hidden="true"></span>&#9650; clears threshold &rarr; checked against full order-book depth</span>
         </div>
       </section>
 
       <div class="side">
-        <section class="card" aria-labelledby="chart-h">
+        <section class="card frozen-able" aria-labelledby="chart-h">
           <div class="card-head">
             <h2 id="chart-h">Best edge per scan</h2>
             <span class="sub" id="chart-sub">bps, best of all cycles at each scan</span>
@@ -663,7 +741,10 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
   'use strict';
 
   // ---------------------------------------------------------------- setup
-  var POLL_MS = 1000, FAIL_LIMIT = 3, TIMEOUT_MS = 4000, STALE_SEC = 15;
+  var POLL_MS = 1000, FAIL_LIMIT = 3, TIMEOUT_MS = 4000, CONTROL_TIMEOUT_MS = 5000;
+  var LOG_MAX = 300;           // same as the bot's log buffer
+  var RESORT_MS = 5000;        // the opportunities table is fully re-sorted at most this often...
+  var ROW_JUMP = 2;            // ...but a row this many bps ahead of the one above it moves at once (so does clearing the threshold)
   var MINUS = '−';
   var S = null;                // last good state
   var fails = 0;               // consecutive failed polls
@@ -762,6 +843,12 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
   }
   function home() { return str(S && S.home) || 'home'; }
   function threshold() { return num(obj(S && S.config).min_profit_bps); }
+  function pollSec() { var p = num(obj(S && S.config).poll_interval_sec); return p !== null && p > 0 ? p : 1; }
+  // no new snapshot for this long while the bot says it is running -> say so
+  function staleSec() { return Math.max(15, 3 * pollSec()); }
+  function sinceFresh() { return lastFreshPerf ? (performance.now() - lastFreshPerf) / 1000 : 0; }
+  function isStopped() { return !!S && str(S.status) === 'stopped'; }
+  function isStale() { return !!S && !offline() && !isStopped() && sinceFresh() > staleSec(); }
 
   // "USDT > USDC > TRY > USDT" -> USDT -> USDC -> TRY -> USDT, built from text nodes only
   function pathNode(path, cls) {
@@ -866,16 +953,32 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
       m.appendChild(el('span', null, (mode || 'unknown mode').toUpperCase()));
     }
     setText($('home'), home());
+    document.body.classList.toggle('is-stopped', isStopped());
     var started = num(S.started_at), now = serverNow();
+    setText($('up-l'), isStopped() ? 'Ran' : 'Up');
     setText($('uptime'), started === null ? '—' : duration(now - started));
     tick();
+    updateStick();
+  }
+
+  // On phones only the status row and the buttons stay pinned: the brand row scrolls away.
+  var narrowMq = window.matchMedia ? window.matchMedia('(max-width: 680px)') : null;
+  var stickTop = null;
+  function updateStick() {
+    var v = 0;
+    if (narrowMq && narrowMq.matches) {
+      v = -Math.max(0, Math.round($('statusbox').getBoundingClientRect().top - $('topbar').getBoundingClientRect().top - 8));
+    }
+    if (v !== stickTop) { $('topbar').style.top = v + 'px'; stickTop = v; }
   }
 
   function statusInfo() {
     if (!S) return { cls: offline() ? 'offline' : '', label: offline() ? 'Disconnected' : 'Connecting…' };
     if (offline()) return { cls: 'offline', label: 'Disconnected' };
     var st = str(S.status).toLowerCase();
-    return { cls: st + (st === 'stopped' && S.stop_fatal ? ' fatal' : ''), label: STATUS_LABEL[st] || (st ? st : 'Unknown') };
+    var label = STATUS_LABEL[st] || (st ? st : 'Unknown');
+    if (isStale()) return { cls: st + ' stale', label: label.replace('…', '') + ' · no new data' };
+    return { cls: st + (st === 'stopped' && S.stop_fatal ? ' fatal' : ''), label: label };
   }
 
   function renderStatusPill() {
@@ -887,7 +990,8 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
     var mode = S ? str(S.mode).toLowerCase() : '';
     var title = (mode === 'live' ? 'LIVE · ' : '') + info.label.replace('…', '') + ' · Arbitrage bot';
     if (document.title !== title) document.title = title;
-    var color = { running: '#0ca30c', paused: '#fab219', stopping: '#fab219', offline: '#d03b3b' }[info.cls.split(' ')[0]] ||
+    var color = info.cls.indexOf('stale') >= 0 ? '#fab219' :
+      { running: '#0ca30c', paused: '#fab219', stopping: '#fab219', offline: '#d03b3b' }[info.cls.split(' ')[0]] ||
       (info.cls.indexOf('fatal') >= 0 ? '#d03b3b' : '#898781');
     var ring = mode === 'live' ? "%3Ccircle cx='8' cy='8' r='7.2' fill='none' stroke='%23d03b3b' stroke-width='1.6'/%3E" : '';
     var fav = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E" + ring +
@@ -897,16 +1001,29 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
     if (announce !== lastAnnounced) { $('announce').textContent = 'Bot status: ' + announce; lastAnnounced = announce; }
   }
 
+  var wasStale = false;
   function tick() {
     renderStatusPill();
     var wrap = $('age-wrap');
     if (!lastOkPerf) { setText($('age'), '—'); return; }
-    var since = (performance.now() - lastFreshPerf) / 1000;
-    setText($('age'), ago(since));
-    var stale = since > STALE_SEC && !(S && S.status === 'stopped');
-    wrap.classList.toggle('stale', stale || offline());
-    wrap.title = stale ? 'No new data from the bot for ' + Math.floor(since) + ' s' : '';
+    var since = sinceFresh();
+    if (isStopped()) {
+      // the bot stops refreshing its snapshot once it has stopped: show when, not "updated 5m ago"
+      setText($('age-l'), 'Stopped at');
+      setText($('age'), clock(S.now));
+      wrap.classList.remove('stale');
+      wrap.title = '';
+    } else {
+      setText($('age-l'), 'Updated');
+      setText($('age'), ago(since));
+      var stale = isStale();
+      wrap.classList.toggle('stale', stale || offline());
+      wrap.title = stale ? 'No new data from the bot for ' + Math.floor(since) + ' s' : '';
+    }
     if (offline()) renderConnection();
+    // the status line counts the seconds while nothing new arrives
+    if (isStale() || wasStale) { safe('status line', renderNow); renderControls(); }
+    wasStale = isStale();
   }
 
   function renderConnection() {
@@ -957,55 +1074,122 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
     return best;
   }
 
+  // A cycle's last full order-book check, in words. The bot runs the check inside the scan, before it
+  // publishes the snapshot, so a cycle shown above the threshold already carries this scan's check.
+  function checkInfo(lc) {
+    if (!lc || typeof lc !== 'object') return null;
+    var at = num(lc.at), pb = num(lc.profit_bps), spent = num(lc.spent), profit = num(lc.profit);
+    var thr = threshold(), minAbs = num(obj(S.config).min_profit_abs), h = home();
+    var sized = pb !== null && spent !== null;
+    var bpsOk = thr === null || (sized && pb >= thr), absOk = minAbs === null || profit === null || profit >= minAbs;
+    var tradable = sized && bpsOk && absOk;
+    // why a workable size still isn't traded: the bps threshold, or the minimum profit in the home currency
+    var why = !sized || tradable ? '' : !bpsOk ? 'needs ' + bps(thr) + ' bps' :
+      'only ' + signed(profit, 4) + ' ' + h + '; needs ' + fixed(minAbs, 2);
+    var age = at === null ? null : serverNow() - at;
+    var traded = lc.traded === true;
+    // tradable but not traded: trading was paused when the check ran
+    var verdict = traded ? 'traded' : tradable ? 'paused' : 'not traded';
+    return {
+      age: age,
+      recent: age !== null && age <= Math.max(4, 2 * pollSec() + 1),
+      traded: traded, tradable: tradable, sized: sized, why: why,
+      chipText: verdict,
+      chipCls: traded ? 'good' : tradable ? 'warn' : 'quiet',
+      result: sized ? bps(pb) + ' bps' : 'no workable size',
+      resultCls: sized ? signClass(pb, 1) : 'muted',
+      size: sized ? ' on ' + fixed(spent, spent % 1 ? 2 : 0) + ' ' + h : '',
+      // once stopped, "x ago" would count from the stop, not from now; the time is in the tooltip
+      ageTxt: age === null || isStopped() ? '' : age < 1 ? 'now' : ago(age),
+      title: 'Full order-book check' + (at === null ? '' : ' at ' + clock(at)) + ': ' +
+        (sized ? 'spend ' + amount(spent) + ' ' + h + ', expect ' + signed(profit, 6) + ' ' + h + ' (' + bps(pb) + ' bps) after fees, depth and rounding'
+               : 'no trade size between the minimum and maximum works at these prices') +
+        (traded ? ' — traded' : tradable ? ' — would have traded, but trading was paused' :
+          ' — not traded' + (why ? ' (' + why + ')' : ''))
+    };
+  }
+
   function renderNow() {
-    var box = $('now'), text = $('now-text'), side = $('now-side');
-    var parts = [], tone = 'accent';
+    var box = $('now'), side = $('now-side');
+    var head = '', detail = [], tone = 'accent';
     var thr = S ? threshold() : null;
-    var thrTxt = thr === null ? 'the threshold' : bps(thr);
+    var thrTxt = thr === null ? 'the threshold' : bps(thr) + ' bps';
     if (!S) {
-      parts = [offline() ? 'Can’t reach the bot.' : 'Connecting to the bot…'];
+      head = offline() ? 'Can’t reach the bot' : 'Connecting to the bot…';
+      detail = [offline() ? 'Start it with  python -m arbitrage_bot --ui  and this page connects by itself.' : 'Waiting for the first update.'];
       tone = offline() ? 'bad' : 'muted';
     } else if (S.status === 'stopped') {
-      parts = [S.stop_reason ? 'Stopped (reason above) — nothing is being watched or traded.' : 'Stopped — nothing is being watched or traded.'];
+      head = 'Stopped — nothing is being watched or traded';
+      detail = [(S.stop_reason ? 'The reason is shown above. ' : '') + 'Start the bot again from your terminal to continue.'];
       tone = S.stop_fatal ? 'bad' : 'muted';
     } else if (S.status === 'stopping') {
-      parts = ['Stopping — finishing the current cycle, then exiting.'];
+      head = 'Stopping — finishing the current cycle, then exiting';
+      detail = ['No new cycles will be started.'];
       tone = 'warn';
     } else {
       var cycles = arr(S.cycles).filter(function (c) { return c && typeof c === 'object'; }), best = bestCycle();
-      var hot = cycles.filter(function (c) { var e = num(c && c.edge_bps); return e !== null && thr !== null && e >= thr; });
-      var scans = num(obj(S.stats).scans);
+      var hot = cycles.filter(function (c) { var e = num(c.edge_bps); return e !== null && thr !== null && e >= thr; });
+      var scans = num(obj(S.stats).scans), n = cycles.length;
+      var paused = S.status === 'paused';
       if (!best) {
-        parts = [scans ? 'Waiting for prices on ' + cycles.length + ' cycles…' : 'Starting up — loading markets and the first prices…'];
+        head = scans ? 'Waiting for prices on ' + n + ' cycles…' : 'Starting up — loading markets and the first prices…';
+        detail = [paused ? 'Trading is paused.' : 'Nothing to compare yet.'];
         tone = 'muted';
-      } else if (S.status === 'paused') {
-        parts = ['Paused — watching ' + cycles.length + ' cycles, placing no orders. Best is ' + bps(best.e) + ' bps on ', { path: best.c.path },
-          thr !== null ? ' (needs ' + thrTxt + ' to trade).' : '.'];
-        tone = 'warn';
       } else if (hot.length) {
-        parts = [hot.length + (hot.length === 1 ? ' cycle clears ' : ' cycles clear ') + thrTxt + ' bps at the top of the book — checking order-book depth before trading. Best: ' + bps(best.e) + ' bps on ', { path: best.c.path }, '.'];
-        tone = 'good';
+        // the verdict goes in the headline: on a narrow desktop the detail line may be cut short
+        var ci = checkInfo(best.c.last_check), verdict;
+        detail = ['Best ' + bps(best.e) + ' bps on ', { path: best.c.path }];
+        if (!ci || !ci.recent) {
+          verdict = 'not depth-checked';
+          detail.push('. No full order-book check this scan (see the log).');
+        } else if (!ci.sized) {
+          verdict = paused ? 'would not trade' : 'not traded';
+          detail.push('; no trade size works at full order-book depth.');
+        } else {
+          verdict = ci.traded ? 'traded' : ci.tradable ? 'would trade if you resume' : paused ? 'would not trade' : 'not traded';
+          detail.push('; at full order-book depth ' + ci.result + ci.size + (!ci.traded && ci.why ? ' (' + ci.why + ').' : '.'));
+        }
+        head = (paused ? 'Paused — ' : '') + hot.length + (hot.length === 1 ? ' cycle clears ' : ' cycles clear ') + thrTxt + ' at the top of the book: ' + verdict;
+        tone = paused ? 'warn' : 'good';
       } else {
-        parts = ['Watching ' + cycles.length + ' cycles — best is ' + bps(best.e) + ' bps on ', { path: best.c.path }];
-        if (thr !== null) parts.push(', needs ' + thrTxt + ' to trade (' + fixed(thr - best.e, 1) + ' bps short).');
-        tone = 'accent';
+        head = paused ? 'Paused — watching ' + n + ' cycles, placing no orders' : 'Watching ' + n + ' cycles — none clears ' + thrTxt + ' yet';
+        detail = ['Best now: ' + bps(best.e) + ' bps on ', { path: best.c.path }];
+        if (thr !== null) detail.push(' · needs ' + thrTxt + ' to trade (' + fixed(thr - best.e, 1) + ' bps short)');
+        var waiting = cycles.filter(function (c) { return num(c.edge_bps) === null; }).length;
+        if (waiting) detail.push(' · ' + waiting + ' still waiting for prices');
+        tone = paused ? 'warn' : 'accent';
+      }
+      if (isStale()) {
+        head = 'No new prices for ' + Math.floor(sinceFresh()) + ' s';
+        detail = ['The bot may be waiting out an error (see the log) or be stuck.' + (best ? ' Last best: ' + bps(best.e) + ' bps.' : '')];
+        tone = 'warn';
       }
     }
     if (S && offline()) {
-      parts.unshift('Last known (' + clock(S.now) + '): ');
+      head = 'Last known (' + clock(S.now) + '): ' + head;
       tone = 'muted';
     }
     var cls = 'now tone-' + tone;
     if (box.className !== cls) box.className = cls;
-    clear(text);
-    parts.forEach(function (p) { text.appendChild(typeof p === 'string' ? document.createTextNode(p) : pathNode(p.path)); });
+    var h = $('now-h'), d = $('now-d');
+    setText(h, head);
+    h.title = head;
+    var sig = JSON.stringify(detail);
+    if (d.getAttribute('data-sig') !== sig) {
+      d.setAttribute('data-sig', sig);
+      clear(d);
+      detail.forEach(function (p) { if (p) d.appendChild(typeof p === 'string' ? document.createTextNode(p) : pathNode(p.path)); });
+      if (!d.firstChild) d.textContent = '\u00a0';
+      d.title = d.textContent.replace(/\s*→\s*/g, ' → ').replace(/\s+/g, ' ').trim();
+    }
 
     clear(side);
     if (!S) return;
     var t = arr(S.trades)[0];
     if (t) {
       var when = Date.parse(str(t.time));
-      side.appendChild(document.createTextNode('Last trade ' + (isNaN(when) ? '' : ago(serverNow() - when / 1000)) + ' · ' + statusLabel(t.status) + ' · '));
+      var whenTxt = isNaN(when) ? '' : isStopped() ? 'at ' + clock(when / 1000) : ago(serverNow() - when / 1000);
+      side.appendChild(document.createTextNode('Last trade ' + whenTxt + ' · ' + statusLabel(t.status) + ' · '));
       var r = tradeResult(t);
       side.appendChild(el('span', signClass(r, 4), r === null ? '—' : signed(r, 4) + ' ' + home()));
     } else {
@@ -1034,25 +1218,42 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
   function renderKpis() {
     var st = obj(S.stats), h = home();
     moneyNode($('k-net'), st.equity_change, 4);
-    subNode($('k-net-sub'), ['P&L ' + signed(st.pnl, 4), 'fees ' + signed(-(num(st.fees_value) || 0), 4), 'dust ' + signed(st.dust_value, 4)]);
+    var feesV = num(st.fees_value);
+    subNode($('k-net-sub'), ['P&L ' + signed(st.pnl, 4), 'fees ' + (feesV === null ? '—' : signed(-feesV, 4)), 'dust ' + signed(st.dust_value, 4)]);
     $('k-net-sub').title = 'Net = realised P&L − fees paid in other assets (BNB) + value of small leftovers still held, in ' + h;
     moneyNode($('k-pnl'), st.pnl, 4);
     subNode($('k-pnl-sub'), ['planned ' + signed(st.planned_pnl, 4) + ' ' + h]);
     $('k-pnl-sub').title = 'What the plans expected these cycles to make';
 
+    // cycles = won + lost. Unwound and stuck cycles are among them; no-fills and unresolved ones are not.
     setText($('k-cycles'), int(st.cycles));
-    var bits = [int(st.wins) + ' won', int(st.losses) + ' lost'];
-    if (num(st.no_fills)) bits.push(int(st.no_fills) + ' no fill');
-    if (num(st.unwinds)) bits.push(int(st.unwinds) + ' unwound');
-    if (num(st.unresolved)) bits.push({ t: int(st.unresolved) + ' stuck', cls: 'neg' });
-    subNode($('k-cycles-sub'), bits);
-    $('k-cycles-sub').title = bits.map(function (b) { return typeof b === 'string' ? b : b.t; }).join(', ');
+    var cs = $('k-cycles-sub');
+    clear(cs);
+    var stuckN = arr(S.trades).filter(function (t) { return t && t.status === 'stuck'; }).length;
+    var line1 = [int(st.wins) + ' won', int(st.losses) + ' lost'];
+    if (num(st.no_fills)) line1.push('+' + int(st.no_fills) + ' no fill');
+    cs.appendChild(document.createTextNode(line1.join(' · ')));
+    if (num(st.unresolved)) {
+      cs.appendChild(document.createTextNode(' · '));
+      cs.appendChild(el('span', 'neg', '+' + int(st.unresolved) + ' unresolved'));
+    }
+    var incl = [];
+    if (num(st.unwinds)) incl.push(int(st.unwinds) + ' unwound');
+    if (stuckN) incl.push(stuckN + ' stuck');
+    if (incl.length && num(st.cycles)) {
+      cs.appendChild(el('br'));
+      cs.appendChild(document.createTextNode('of the ' + int(st.cycles) + ': ' + incl.join(', ')));
+    }
+    cs.title = int(st.cycles) + ' cycles traded: ' + int(st.wins) + ' won, ' + int(st.losses) + ' lost' +
+      (incl.length ? ' (of these, ' + incl.join(' and ') + ')' : '') +
+      '. Not counted: ' + int(st.no_fills) + ' no-fill (the first order did not fill, nothing was traded)' +
+      ' and ' + int(st.unresolved) + ' unresolved (outcome unknown — check your Binance account).';
 
     setText($('k-scans'), int(st.scans));
-    var sb = [int(st.depth_checks) + ' depth checks', int(st.qualified) + ' qualified'];
+    var sb = [int(st.depth_checks) + ' depth checks', int(st.qualified) + ' passed'];
     if (num(st.errors)) sb.push({ t: int(st.errors) + (num(st.errors) === 1 ? ' error' : ' errors'), cls: 'neg' });
     subNode($('k-scans-sub'), sb);
-    $('k-scans-sub').title = int(st.scans) + ' scans, ' + int(st.screened) + ' passed the quick screen, ' + int(st.depth_checks) + ' full depth checks, ' + int(st.qualified) + ' qualified to trade';
+    $('k-scans-sub').title = int(st.scans) + ' scans of all cycles, ' + int(st.screened) + ' cycles cleared the threshold at the top of the book, ' + int(st.depth_checks) + ' full order-book depth checks, ' + int(st.qualified) + ' passed the depth check (good enough to trade)';
 
     var be = num(st.best_edge_bps), thr = threshold();
     var kb = $('k-best');
@@ -1083,86 +1284,138 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
 
   // ---------------------------------------------------------------- render: opportunities
   var oppRows = new Map();
-  var oppDomain = null;
-
-  function niceCeil(v, step) { return Math.ceil(v / step) * step; }
+  var oppOrder = [];           // row keys in the order shown last time
+  var oppSortedAt = -Infinity; // performance.now() of the last re-sort
 
   function cycleFees(c) {
     var fees = obj(S.fees_bps), total = 0, known = 0;
     arr(c.symbols).forEach(function (s) { var f = num(fees[s]); if (f !== null) { total += f; known++; } });
     return known ? total : null;
   }
+  function cycleKey(c) { return str(c.path) + '|' + arr(c.symbols).join(','); }
 
+  function makeBar() {
+    var bar = el('div', 'bar');
+    var parts = { bar: bar, fill: el('span', 'fill'), zero: el('span', 'zero-l'), thr: el('span', 'thr'), nod: el('span', 'nodata', 'no price yet') };
+    bar.appendChild(parts.fill); bar.appendChild(parts.zero); bar.appendChild(parts.thr); bar.appendChild(parts.nod);
+    return parts;
+  }
   function makeOppRow() {
     var tr = el('tr');
     var td0 = el('td', 'path-cell');
     var pw = el('div', 'pw');
+    var barM = makeBar();               // narrow screens: the bar sits under the cycle name
+    barM.bar.classList.add('bar-m');
     var sub = el('div', 'sub-line');
-    td0.appendChild(pw); td0.appendChild(sub);
+    td0.appendChild(pw); td0.appendChild(barM.bar); td0.appendChild(sub);
     var td1 = el('td', 'r');
     var ev = el('span', 'edge-v num');
     td1.appendChild(ev);
-    var td2 = el('td');
-    var bar = el('div', 'bar');
-    var zero = el('span', 'zero-l'), fill = el('span', 'fill'), thr = el('span', 'thr'), nod = el('span', 'nodata', 'no price yet');
-    bar.appendChild(fill); bar.appendChild(zero); bar.appendChild(thr); bar.appendChild(nod);
-    td2.appendChild(bar);
+    var td2 = el('td', 'c-bar');
+    var barD = makeBar();
+    td2.appendChild(barD.bar);
     var td3 = el('td', 'r c-best muted');
     var td4 = el('td', 'r c-fees muted');
     var td5 = el('td', 'c-check check-cell');
     [td0, td1, td2, td3, td4, td5].forEach(function (td) { tr.appendChild(td); });
-    return { tr: tr, pw: pw, sub: sub, ev: ev, bar: bar, zero: zero, fill: fill, thr: thr, nod: nod, best: td3, fees: td4, check: td5, key: '', pathTxt: null };
+    return { tr: tr, pw: pw, sub: sub, ev: ev, bars: [barD, barM], best: td3, fees: td4, check: td5, key: '', pathTxt: null };
   }
 
-  function lastCheckParts(lc) {
-    if (!lc || typeof lc !== 'object') return null;
-    var at = num(lc.at), pb = num(lc.profit_bps), spent = num(lc.spent);
-    return {
-      main: pb === null ? '—' : bps(pb) + ' bps',
-      rest: (spent === null ? '' : ' at ' + fixed(spent, spent % 1 ? 2 : 0)) + (at === null ? '' : ' · ' + ago(serverNow() - at)),
-      title: 'Depth check' + (at === null ? '' : ' at ' + clock(at)) + ': spend ' + amount(spent) + ' ' + home() +
-        ', expected ' + signed(lc.profit, 6) + ' ' + home() + ' (' + bps(pb) + ' bps) after fees, depth and rounding' +
-        (lc.traded ? ' — traded' : ' — not traded'),
-      traded: !!lc.traded,
-      cls: signClass(pb, 1)
-    };
+  // Order rows best first, without reshuffling every second: cycles at or above the threshold go to the
+  // top at once, and so does any row that gets more than ROW_JUMP ahead of the one above it. Everything
+  // else waits for the full re-sort every RESORT_MS (rows whose shown values are equal never swap).
+  function orderCycles(cycles, isHot, settled) {
+    var byKey = new Map();
+    cycles.forEach(function (c) { byKey.set(cycleKey(c), c); });
+    function E(k) { return num(byKey.get(k).edge_bps); }
+    var keys = oppOrder.filter(function (k) { return byKey.has(k); });
+    var fresh = !keys.length;
+    cycles.forEach(function (c) { var k = cycleKey(c); if (keys.indexOf(k) < 0) keys.push(k); });
+    var hot = keys.filter(function (k) { return isHot(E(k)); })
+      .sort(function (a, b) { return E(b) - E(a); });
+    var rest = keys.filter(function (k) { return !isHot(E(k)) && E(k) !== null; });
+    var noData = keys.filter(function (k) { return E(k) === null; });
+    // settled = the prices no longer change (stopped): just show them in order
+    var due = settled || performance.now() - oppSortedAt >= RESORT_MS;
+    if (fresh) rest.sort(function (a, b) { return E(b) - E(a) || (a < b ? -1 : 1); });
+    if (fresh || due) oppSortedAt = performance.now();
+    var margin = due ? 0.05 : ROW_JUMP;
+    for (var pass = 0; pass < rest.length; pass++) {
+      var swapped = false;
+      for (var i = 1; i < rest.length; i++) {
+        if (E(rest[i]) > E(rest[i - 1]) + margin) {
+          var t = rest[i]; rest[i] = rest[i - 1]; rest[i - 1] = t; swapped = true;
+        }
+      }
+      if (!swapped) break;
+    }
+    oppOrder = hot.concat(rest, noData);
+    return oppOrder.map(function (k) { return byKey.get(k); });
+  }
+
+  // One linear scale for every bar. The trade threshold has to be told apart from zero, so the scale keeps
+  // at least 8 px between them and clips the worst (least interesting) edges instead.
+  function oppScale(cycles, thr, barPx) {
+    var minE = 0, maxE = 0;
+    cycles.forEach(function (c) {
+      var e = num(c.edge_bps);
+      if (e !== null) { minE = Math.min(minE, e); maxE = Math.max(maxE, e); }
+    });
+    var hi = Math.max(5, Math.ceil(Math.max(maxE, thr !== null && thr > 0 ? thr * 2.5 : 0) / 5) * 5);
+    var lo = -Math.max(10, Math.ceil(-minE / 5) * 5);
+    if (thr !== null && thr > 0 && barPx > 0) {
+      var maxRange = barPx * thr / 8;
+      if (hi - lo > maxRange) lo = -Math.max(5, Math.floor((maxRange - hi) / 5) * 5);
+    }
+    return { lo: lo, hi: hi, clipped: minE < lo };
+  }
+
+  function updateBar(b, e, hot, pos, thr) {
+    b.nod.hidden = e !== null;
+    b.zero.hidden = e === null;
+    b.zero.style.left = pos(0) + '%';
+    if (thr !== null && e !== null) { b.thr.hidden = false; b.thr.style.left = pos(thr) + '%'; } else b.thr.hidden = true;
+    if (e === null) { b.fill.style.width = '0'; return; }
+    var a = pos(Math.min(0, e)), z = pos(Math.max(0, e));
+    b.fill.style.left = a + '%';
+    b.fill.style.width = Math.max(e === 0 ? 0 : 0.8, z - a) + '%';
+    var clipped = e < 0 && a <= 0;
+    b.fill.className = 'fill ' + (e < 0 ? 'neg' + (clipped ? ' clip' : '') : hot ? 'pos hot' : 'pos');
+  }
+
+  function renderScale(node, sc, pos, thr) {
+    var key = sc.lo + ':' + sc.hi + ':' + thr;
+    if (node.getAttribute('data-k') === key) return;
+    node.setAttribute('data-k', key);
+    clear(node);
+    node.appendChild(el('span', 'lo', (sc.clipped ? '≤' : '') + fixed(sc.lo, 0)));
+    var z = el('span', 'zl', '0'); z.style.left = pos(0) + '%'; node.appendChild(z);
+    if (thr !== null && thr > 0 && thr < sc.hi) {
+      var t = el('span', 'tl', signed(thr, thr % 1 ? 1 : 0)); t.style.left = pos(thr) + '%'; node.appendChild(t);
+    }
+    node.title = 'Bar scale: ' + fixed(sc.lo, 0) + ' to +' + sc.hi + ' bps. Solid line = 0 (break-even), dashed green line = trade threshold' +
+      (thr !== null ? ' ' + bps(thr) + ' bps' : '') + (sc.clipped ? '. Edges below ' + fixed(sc.lo, 0) + ' are cut off at the left end.' : '.');
   }
 
   function renderCycles() {
     var cycles = arr(S.cycles).filter(function (c) { return c && typeof c === 'object'; });
     var thr = threshold();
-    var sorted = cycles.slice().sort(function (a, b) {
-      var ea = num(a.edge_bps), eb = num(b.edge_bps);
-      if (ea === null && eb === null) return str(a.path) < str(b.path) ? -1 : 1;
-      if (ea === null) return 1;
-      if (eb === null) return -1;
-      return eb - ea || (str(a.path) < str(b.path) ? -1 : 1);
-    });
+    var stopped = isStopped();
+    function isHot(e) { return !stopped && e !== null && thr !== null && e >= thr; }
+    var sorted = orderCycles(cycles, isHot, stopped);
 
-    // one shared scale for every row: negative side to the worst edge, positive side to the threshold / best
-    var minE = 0, maxE = 0;
-    sorted.forEach(function (c) {
-      var e = num(c.edge_bps);
-      if (e !== null) { minE = Math.min(minE, e); maxE = Math.max(maxE, e); }
-    });
-    var lo = -Math.max(10, niceCeil(-minE, 10));
-    var hi = Math.max(10, niceCeil(Math.max(maxE, thr === null ? 0 : thr * 4), 5));
-    var domainKey = lo + ':' + hi;
-    function pos(v) { return (Math.min(hi, Math.max(lo, v)) - lo) / (hi - lo) * 100; }
-    if (domainKey !== oppDomain) {
-      oppDomain = domainKey;
-      var sc = $('opp-scale');
-      clear(sc);
-      var l = el('span', 'lo', fixed(lo, 0)); sc.appendChild(l);
-      var z = el('span', null, '0'); z.style.left = pos(0) + '%'; sc.appendChild(z);
-      sc.title = 'Bar scale: ' + fixed(lo, 0) + ' to +' + hi + ' bps; the green tick is the trade threshold';
-    }
+    var narrow = $('opp-scale-m').offsetParent !== null && $('opp-scale-m').offsetWidth > 0;
+    var scaleEl = narrow ? $('opp-scale-m') : $('opp-scale');
+    var sc = oppScale(sorted, thr, scaleEl.clientWidth);
+    function pos(v) { return (Math.min(sc.hi, Math.max(sc.lo, v)) - sc.lo) / (sc.hi - sc.lo) * 100; }
+    renderScale($('opp-scale'), sc, pos, thr);
+    renderScale($('opp-scale-m'), sc, pos, thr);
 
     var body = $('opp-body');
     var seen = new Set();
     var hotCount = 0;
     sorted.forEach(function (c, i) {
-      var key = str(c.path) + '|' + arr(c.symbols).join(',');
+      var key = cycleKey(c);
       var row = oppRows.get(key);
       if (!row) { row = makeOppRow(); row.key = key; oppRows.set(key, row); }
       seen.add(key);
@@ -1173,46 +1426,39 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
         row.tr.title = arr(c.symbols).length ? 'Legs: ' + arr(c.symbols).join(' → ') : '';
       }
       var e = num(c.edge_bps);
-      var hot = e !== null && thr !== null && e >= thr;
+      var hot = isHot(e);
       if (hot) hotCount++;
-      row.tr.className = hot ? 'hot' : '';
+      var cls = hot ? 'hot' : '';
+      if (row.tr.className !== cls) row.tr.className = cls;
       // edge number
       clear(row.ev);
       if (hot) row.ev.appendChild(el('span', 'tri', '▲'));
       row.ev.appendChild(document.createTextNode(e === null ? '—' : bps(e)));
       row.ev.parentNode.title = e === null ? 'No price data yet' :
-        'Top-of-book return after fees: ' + bps(e) + ' bps (' + signed(e / 100, 3) + '%)' + (thr !== null ? (hot ? ' — clears ' : ' — needs ') + bps(thr) + ' bps' : '');
-      // bar
-      row.nod.hidden = e !== null;
-      row.zero.hidden = e === null;
-      row.zero.style.left = pos(0) + '%';
-      if (thr !== null && e !== null) { row.thr.hidden = false; row.thr.style.left = pos(thr) + '%'; } else row.thr.hidden = true;
-      if (e === null) { row.fill.style.width = '0'; }
-      else {
-        var a = pos(Math.min(0, e)), b = pos(Math.max(0, e));
-        row.fill.style.left = a + '%';
-        row.fill.style.width = Math.max(e === 0 ? 0 : 0.8, b - a) + '%';
-        row.fill.className = 'fill ' + (e < 0 ? 'neg' : hot ? 'pos hot' : 'pos');
-      }
+        'Top-of-book return after fees: ' + bps(e) + ' bps (' + signed(e / 100, 3) + '%)' + (thr !== null ? (e >= thr ? ' — clears ' : ' — needs ') + bps(thr) + ' bps' : '');
+      row.bars.forEach(function (b) { updateBar(b, e, hot, pos, thr); });
       // best, fees, check
       setText(row.best, num(c.best_edge_bps) === null ? '—' : bps(c.best_edge_bps));
       var f = cycleFees(c);
       setText(row.fees, f === null ? '—' : fixed(f, 0));
       row.fees.title = f === null ? '' : 'Fees ' + fixed(f, 1) + ' bps for three legs; edge before fees ≈ ' + (e === null ? '—' : bps(e + f)) + ' bps';
-      var lc = lastCheckParts(c.last_check);
+      var ci = checkInfo(c.last_check);
       clear(row.check);
       clear(row.sub);
-      if (lc) {
-        row.check.appendChild(el('span', 'lc-main ' + lc.cls, lc.main));
-        row.check.appendChild(el('span', 'muted small', lc.rest));
-        if (lc.traded) { row.check.appendChild(document.createTextNode(' ')); row.check.appendChild(el('span', 'chip good', 'traded')); }
-        row.check.title = lc.title;
-        row.sub.appendChild(el('span', null, 'depth check ' + lc.main + lc.rest + (lc.traded ? ' · traded' : '')));
-        row.sub.title = lc.title;
+      if (ci) {
+        row.check.appendChild(el('span', 'chip ' + ci.chipCls, ci.chipText));
+        row.check.appendChild(el('span', 'lc-main ' + ci.resultCls, ci.result));
+        row.check.appendChild(el('span', 'muted small', ci.size + (ci.ageTxt ? ' · ' + ci.ageTxt : '')));
+        row.check.title = ci.title;
+        row.sub.appendChild(el('span', 'chip ' + ci.chipCls, ci.chipText));
+        row.sub.appendChild(document.createTextNode('depth check ' + ci.result + ci.size + (ci.ageTxt ? ' · ' + ci.ageTxt : '')));
+        row.sub.title = ci.title;
+        row.sub.hidden = false;
       } else {
-        row.check.appendChild(el('span', 'muted small', 'not checked yet'));
+        row.check.appendChild(el('span', 'muted small', hot ? 'not depth-checked (see log)' : 'not checked yet'));
         row.check.title = 'The bot only checks order-book depth for cycles that clear the threshold at the top of the book';
-        row.sub.appendChild(el('span', null, hot ? 'clears threshold — depth check next' : ' '));
+        if (hot) row.sub.appendChild(document.createTextNode('clears the threshold — not depth-checked (see log)'));
+        row.sub.hidden = !hot;
       }
       if (body.children[i] !== row.tr) body.insertBefore(row.tr, body.children[i] || null);
     });
@@ -1225,9 +1471,11 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
     } else if (sorted.length) {
       var er = body.querySelector('.empty-row'); if (er) er.parentNode.removeChild(er);
     }
-    setText($('opp-right'), sorted.length ? (hotCount ? hotCount + ' of ' + sorted.length + ' above threshold' : sorted.length + ' cycles · none above threshold') : '');
+    setText($('opp-right'), !sorted.length ? '' : stopped ? 'last prices before the stop, ' + clock(S.now) :
+      hotCount ? hotCount + ' of ' + sorted.length + ' above threshold' : sorted.length + ' cycles · none above threshold');
     setText($('leg-thr'), thr === null ? 'trade threshold' : 'trade threshold ' + bps(thr) + ' bps');
-    setText($('opp-home-note'), ' \u00b7 each ends back in ' + home());
+    setText($('opp-note'), 'Edge = what one loop (' + home() + ' → … → ' + home() + ') would return after fees at the current best prices' +
+      ' · 1 bps = 0.01% · trades at ' + (thr === null ? 'the threshold' : bps(thr) + ' bps') + ' or better');
   }
 
   // ---------------------------------------------------------------- render: chart
@@ -1277,24 +1525,34 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
     if (thr !== null && thr < hi) {
       sv('rect', { x: M.l, y: M.t, width: pw, height: Math.max(0, Y(thr) - M.t), fill: 'var(--good-wash)' }, svg);
     }
-    // y grid + ticks
-    for (var v = lo, guard = 0; v <= hi + step * 1e-6 && guard < 40; v += step, guard++) {
-      var yy = Math.round(Y(v)) + 0.5, isZero = Math.abs(v) < step * 1e-6;
+    // y grid + ticks; as many decimals as the step needs (a 2.5 step must not print +2.5 as "+3")
+    var ydp = 0;
+    while (ydp < 3 && Math.abs(Math.round(step * Math.pow(10, ydp)) - step * Math.pow(10, ydp)) > 1e-6) ydp++;
+    for (var k = Math.round(lo / step), guard = 0; k * step <= hi + step * 1e-6 && guard < 40; k++, guard++) {
+      var v = k * step;
+      var yy = Math.round(Y(v)) + 0.5, isZero = k === 0;
       sv('line', { x1: M.l, x2: M.l + pw, y1: yy, y2: yy, stroke: isZero ? 'var(--axis)' : 'var(--grid)', 'stroke-width': 1 }, svg);
       var tx = sv('text', { x: M.l - 6, y: yy + 3.5, 'text-anchor': 'end', 'class': 'ax' }, svg);
-      tx.textContent = isZero ? '0' : signed(v, step < 1 ? 1 : 0);
+      tx.textContent = isZero ? '0' : signed(v, ydp);
     }
     // x ticks
-    var target = Math.max(3, Math.floor(pw / 80));
+    var target = Math.max(3, Math.floor(pw / 50));
     var steps = [5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400];
     var xs = steps[steps.length - 1];
-    for (var i = 0; i < steps.length; i++) if ((t1 - t0) / steps[i] <= target) { xs = steps[i]; break; }
+    for (var i = 0; i < steps.length; i++) if ((t1 - t0) / steps[i] <= target + 1) { xs = steps[i]; break; }
+    // centred time labels; drop any that would stick out of the chart or come too close to the previous one
+    var prevRight = -Infinity;
     for (var tt = Math.ceil(t0 / xs) * xs; tt <= t1; tt += xs) {
       var xx = Math.round(X(tt)) + 0.5;
       sv('line', { x1: xx, x2: xx, y1: M.t + ph, y2: M.t + ph + 4, stroke: 'var(--axis)' }, svg);
-      var anchor = xx < M.l + 24 ? 'start' : xx > M.l + pw - 24 ? 'end' : 'middle';
-      var lab = sv('text', { x: xx, y: M.t + ph + 17, 'text-anchor': anchor, 'class': 'ax' }, svg);
+      var lab = sv('text', { x: xx, y: M.t + ph + 17, 'text-anchor': 'middle', 'class': 'ax' }, svg);
       lab.textContent = clock(tt, xs < 60);
+      var bb = null;
+      try { bb = lab.getBBox(); } catch (e) { bb = null; }
+      if (bb && bb.width) {
+        if (bb.x < 2 || bb.x + bb.width > W - 2 || bb.x < prevRight + 8) { svg.removeChild(lab); continue; }
+        prevRight = bb.x + bb.width;
+      }
     }
     sv('line', { x1: M.l, x2: M.l + pw, y1: M.t + ph + 0.5, y2: M.t + ph + 0.5, stroke: 'var(--axis)' }, svg);
     // threshold line (its label goes on top of the data, below)
@@ -1336,7 +1594,8 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
       ? 'Best edge per scan over the last ' + duration(hist[hist.length - 1].t - hist[0].t) + ': latest ' + bps(lastV) + ' bps, highest ' + bps(Math.max.apply(null, vals)) + ', lowest ' + bps(Math.min.apply(null, vals)) + (thr !== null ? '; trade threshold ' + bps(thr) + ' bps' : '') + '. Use the arrow keys to read values.'
       : 'Best edge per scan: no data yet');
     var sub = $('chart-sub');
-    setText(sub, hist.length > 1 ? 'bps · best of all cycles at each scan · last ' + duration(hist[hist.length - 1].t - hist[0].t).replace(/ 00s$/, '') : 'bps · best of all cycles at each scan');
+    setText(sub, (hist.length > 1 ? 'bps · best of all cycles at each scan · last ' + duration(hist[hist.length - 1].t - hist[0].t).replace(/ 00s$/, '') : 'bps · best of all cycles at each scan') +
+      (isStopped() ? ' · ended at the stop' : ''));
     showHover();
   }
 
@@ -1568,20 +1827,31 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
     } else full = true;
     if (!full && start >= evs.length) { renderLogMeta(evs); return; }
     var stick = full || atBottom();
-    var beforeH = logBox.scrollHeight;
     if (full) { clear(logBox); logCount = 0; }
-    var frag = document.createDocumentFragment();
-    for (var j = full ? 0 : start; j < evs.length; j++) { frag.appendChild(logLine(evs[j])); logCount++; }
+    var frag = document.createDocumentFragment(), added = 0;
+    var problemsOnly = logBox.classList.contains('only-problems');
+    for (var j = full ? 0 : start; j < evs.length; j++) {
+      var line = logLine(evs[j]);
+      frag.appendChild(line); logCount++;
+      if (!problemsOnly || !line.classList.contains('lv-INFO')) added++;
+    }
+    var emptyMsg = logBox.querySelector('.log-empty');
+    if (emptyMsg && evs.length) logBox.removeChild(emptyMsg);
     logBox.appendChild(frag);
-    // keep the DOM bounded to what the server keeps
+    // keep the DOM bounded to what the bot keeps; .log has overflow-anchor: none, so this is the only
+    // scroll correction for the lines removed above the reader's position
     var removedH = 0;
-    while (logCount > 400 && logBox.firstChild) { removedH += logBox.firstChild.offsetHeight; logBox.removeChild(logBox.firstChild); logCount--; }
+    while (logCount > LOG_MAX && logBox.firstChild) {
+      if (logBox.firstChild.classList && logBox.firstChild.classList.contains('ln')) logCount--;
+      removedH += logBox.firstChild.offsetHeight;
+      logBox.removeChild(logBox.firstChild);
+    }
     logLastKey = evs.length ? evKey(evs[evs.length - 1]) : null;
-    if (!evs.length) { logBox.appendChild(el('div', 'log-empty', 'Nothing logged yet.')); logLastKey = null; }
+    if (!evs.length && !logBox.firstChild) { logBox.appendChild(el('div', 'log-empty', 'Nothing logged yet.')); logLastKey = null; }
     if (stick) { logBox.scrollTop = logBox.scrollHeight; $('jump').hidden = true; }
     else {
       if (removedH) logBox.scrollTop = Math.max(0, logBox.scrollTop - removedH);
-      if (logBox.scrollHeight !== beforeH) $('jump').hidden = false;
+      if (added) $('jump').hidden = false;
     }
     renderLogMeta(evs);
   }
@@ -1616,13 +1886,21 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
     pause.disabled = dead || st !== 'running';
     resume.disabled = dead || st !== 'paused';
     stop.disabled = dead;
+    // an error about a button goes away once the situation it was about has changed
+    if (ctlErrSig !== null && ctlSig() !== ctlErrSig) showCtlError(null);
   }
 
+  var ctlErrSig = null, ctlErrTimer = null;
+  function ctlSig() { return (offline() ? 'offline' : 'online') + '|' + (S ? str(S.status) : ''); }
   function showCtlError(msg) {
     var b = $('ctl-error');
+    clearTimeout(ctlErrTimer);
     b.hidden = !msg;
-    b.textContent = msg || '';
+    setText($('ctl-error-text'), msg || '');
+    ctlErrSig = msg ? ctlSig() : null;
+    if (msg) ctlErrTimer = setTimeout(function () { showCtlError(null); }, 10000);
   }
+  $('ctl-error-x').addEventListener('click', function () { showCtlError(null); });
 
   var VERB = { pause: 'pause trading', resume: 'resume trading', stop: 'stop the bot' };
   function control(action) {
@@ -1637,7 +1915,10 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
     busy = true;
     showCtlError(null);
     renderControls();
-    fetch('/api/' + action, { method: 'POST', headers: { 'X-Arb-Dashboard': '1' }, cache: 'no-store' })
+    // never leave the buttons locked: give up on a request that hangs
+    var ctrl = ('AbortController' in window) ? new AbortController() : null;
+    var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, CONTROL_TIMEOUT_MS);
+    fetch('/api/' + action, { method: 'POST', headers: { 'X-Arb-Dashboard': '1' }, cache: 'no-store', signal: ctrl ? ctrl.signal : undefined })
       .then(function (r) {
         return r.text().then(function (txt) {
           var body = null;
@@ -1654,10 +1935,11 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
       })
       .catch(function (err) {
         var m = err && err.message ? err.message : String(err);
-        if (/fetch|network|load failed/i.test(m)) m = 'can’t reach the bot';
+        if (err && err.name === 'AbortError') m = 'no answer within ' + (CONTROL_TIMEOUT_MS / 1000) + ' s — the bot may be busy; watch the status above';
+        else if (/fetch|network|load failed/i.test(m)) m = 'can’t reach the bot';
         showCtlError('Couldn’t ' + VERB[action] + ': ' + m);
       })
-      .then(function () { busy = false; renderControls(); });
+      .then(function () { clearTimeout(timer); busy = false; renderControls(); });
   }
   $('btn-pause').addEventListener('click', function () { control('pause'); });
   $('btn-resume').addEventListener('click', function () { control('resume'); });
@@ -1667,7 +1949,7 @@ footer { color: var(--muted); font-size: 12px; padding: 0 0 28px; }
   var resizeTimer = null;
   window.addEventListener('resize', function () {
     clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(function () { if (S) safe('chart', renderChart); }, 80);
+    resizeTimer = setTimeout(function () { updateStick(); if (S) { safe('chart', renderChart); safe('opportunities', renderCycles); } }, 80);
   });
   setInterval(function () { safe('tick', tick); }, 500);
   renderControls();
