@@ -103,3 +103,10 @@ def test_size_grid():
     grid = size_grid(D("10"), D("1000"), 3)
     assert grid == [D("10"), D("100"), D("1000")]
     assert size_grid(D("10"), D("5"), 5) == []
+
+
+def test_buy_is_sized_to_fit_the_budget_at_its_limit_price(cycles, rules, fees):
+    books = profitable_books()
+    books["USDCUSDT"] = make_book("USDCUSDT", [(0.9999, 5000)], [(0.9990, 60), (1.0000, 5000)])
+    leg1 = plan_cycle(cycles[0], D("100"), books, rules, fees).legs[0]
+    assert leg1.limit_price == 1 and leg1.base_qty * leg1.limit_price <= 100  # what Binance reserves

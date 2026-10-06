@@ -161,3 +161,35 @@ def test_risk_checks_run_even_if_post_trade_refresh_fails(config, paper, market,
     paper.balances = broken
     with pytest.raises(StopTrading, match="max_cycles"):
         bot.step()
+
+
+def test_paper_does_not_trade_the_same_liquidity_twice(config, paper, market, index, cycles, fees):
+    market.books["USDCUSDT"] = make_book("USDCUSDT", [(0.9999, 5000)], [(1.0000, 100), (1.0040, 5000)])
+    bot = make_bot(config, paper, index, cycles, fees)
+    statuses = [r.status for r in (bot.step() for _ in range(5)) if r]
+    assert statuses == ["completed"]  # the cheap 100 USDC were only there once
+
+
+def test_full_balance_trade_is_not_rejected_for_the_limit_price_reserve(config, market, rules, index, cycles, fees):
+    from arbitrage_bot.exchange import PaperExchange
+
+    market.books["USDCUSDT"] = make_book("USDCUSDT", [(0.9999, 5000)], [(0.9990, 60), (1.0000, 5000)])
+    paper = PaperExchange(market, rules, fees, {"USDT": D("100")})
+    config.max_trade, config.max_balance_fraction = D("200"), D("1")
+    assert make_bot(config, paper, index, cycles, fees).step().status == "completed"
+
+
+def test_halted_market_prices_are_handled(config, paper, index, cycles, fees):
+    from arbitrage_bot.market import ZERO, Ticker
+    from arbitrage_bot.triangle import PairIndex
+
+    from conftest import make_rules
+
+    index = PairIndex(EUR_RULES + [make_rules("USDTTRY", "USDT", "TRY", step="1", tick="0.01")])
+    bot = ArbitrageBot(config, paper, CycleExecutor(paper, index, "USDT"), cycles, fees, sleep=lambda s: None)
+    halted = Ticker(ZERO, ZERO, ZERO, ZERO)  # what Binance reports for a market in BREAK
+    bot.tickers = {"USDTTRY": halted, "EURUSDT": halted}
+    bot.dust = {"TRY": D("40"), "EUR": D("1")}
+    assert bot.dust_value() == 0
+    paper.book_tickers = lambda symbols: {s: halted for s in symbols}
+    assert not bot.executor.sweepable("TRY", D("40")) and not bot.executor.sweepable("EUR", D("1"))

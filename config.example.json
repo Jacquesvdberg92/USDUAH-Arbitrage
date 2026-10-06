@@ -31,6 +31,7 @@
   "max_consecutive_losses": 5,
   "max_consecutive_errors": 5,
   "paper_balances": {"USDT": 1000},
+  "paper_depletion_sec": 60,
   "market_data_url": null,
   "stats_interval_sec": 60,
   "log_file": "arbitrage.log",

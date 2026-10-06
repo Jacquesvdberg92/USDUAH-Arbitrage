@@ -19,7 +19,7 @@ class FlakyPaper(PaperExchange):
     def _place(self, params):
         self.placed += 1
         if params["symbol"] in self.fail_on or (self.fail_after is not None and self.placed > self.fail_after):
-            raise BinanceAPIError(503, -1001, "Internal error; unable to process your request.")
+            raise BinanceAPIError(400, -2010, "Order rejected.")  # a definite rejection
         return super()._place(params)
 
 
@@ -94,3 +94,12 @@ def test_tiny_partial_entry_is_kept_as_dust_not_a_stuck_position(paper, market, 
     assert result.status == "unwound"
     assert result.home_spent == 3 and result.home_received == 0
     assert result.dust == {"USDC": D("2.997")}
+
+
+def test_paper_market_fallback_walks_past_what_the_ioc_took(paper, market, index, cycles, rules, fees):
+    plan = plan_for(cycles, rules, fees)  # sells 90.70 EUR at 1.1050
+    market.books["EURUSDT"] = make_book("EURUSDT", [(1.1050, 50), (1.1040, 5000)], [(1.1051, 5000)])
+    result = CycleExecutor(paper, index, "USDT").execute(plan)
+    ioc, fallback = result.legs[-1].orders
+    assert (ioc.executed_qty, ioc.quote_qty) == (D("50"), D("55.25"))
+    assert (fallback.executed_qty, fallback.quote_qty) == (D("40.70"), D("40.70") * D("1.1040"))

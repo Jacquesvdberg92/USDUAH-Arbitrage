@@ -111,3 +111,26 @@ def test_paper_enforces_balance_and_filters(paper):
         paper.limit_ioc("USDCUSDT", BUY, D("10.001"), D("1.0000"))  # not a lot-size multiple
     assert err.value.code == -1013
     assert paper.balances() == {"USDT": 1000}
+
+
+def test_paper_remembers_liquidity_it_took_until_it_expires(market, rules, fees):
+    from arbitrage_bot.exchange import PaperExchange
+
+    clock = [0.0]
+    paper = PaperExchange(market, rules, fees, {"USDT": D("1000")}, depletion_ttl=60, now=lambda: clock[0])
+    paper.market_buy_quote("USDCUSDT", D("100"))
+    assert paper.order_books(["USDCUSDT"])["USDCUSDT"].asks[0] == (D("1.0000"), D("4900"))
+    assert paper.book_tickers(["USDCUSDT"])["USDCUSDT"].ask_qty == 4900
+    clock[0] = 61
+    assert paper.order_books(["USDCUSDT"])["USDCUSDT"].asks[0] == (D("1.0000"), D("5000"))
+
+
+def test_paper_forgets_a_level_once_it_leaves_the_public_book(market, rules, fees):
+    from arbitrage_bot.exchange import PaperExchange
+
+    paper = PaperExchange(market, rules, fees, {"USDT": D("1000")})
+    paper.market_buy_quote("USDCUSDT", D("100"))
+    market.books["USDCUSDT"] = make_book("USDCUSDT", [(0.9999, 5000)], [(1.0001, 5000)])
+    paper.order_books(["USDCUSDT"])  # the 1.0000 level is gone...
+    market.books["USDCUSDT"] = make_book("USDCUSDT", [(0.9999, 5000)], [(1.0000, 70)])
+    assert paper.order_books(["USDCUSDT"])["USDCUSDT"].asks == ((D("1.0000"), D("70")),)  # ...so this is new liquidity

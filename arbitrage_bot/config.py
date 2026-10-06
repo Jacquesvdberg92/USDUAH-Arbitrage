@@ -71,6 +71,7 @@ class Config:
     max_consecutive_errors: int = 5
 
     paper_balances: Dict[str, Decimal] = field(default_factory=lambda: {"USDT": Decimal("1000")})
+    paper_depletion_sec: float = 60.0  # how long paper mode remembers liquidity it already took
     market_data_url: Optional[str] = None  # override; paper mode defaults to data-api.binance.vision
 
     stats_interval_sec: float = 60.0

@@ -111,7 +111,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     fees = resolve_fees(config, symbols, fee_client)
 
     if config.mode == "paper":
-        exchange = PaperExchange(market, index.by_symbol, fees, config.paper_balances, config.depth_limit)
+        exchange = PaperExchange(market, index.by_symbol, fees, config.paper_balances, config.depth_limit, config.paper_depletion_sec)
     else:
         exchange = LiveExchange(market, index.by_symbol, config.depth_limit)
     executor = CycleExecutor(exchange, index, config.home_asset, config.complete_with_market)
@@ -121,9 +121,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(bot.report())
         return 0
 
+    if config.trade_log:
+        try:
+            open(config.trade_log, "a").close()  # fail now, not after the first real trade
+        except OSError as err:
+            log.error("can't write trade_log %r: %s", config.trade_log, err)
+            return 1
+
     log.info("MODE: %s%s", config.mode.upper(), "  *** REAL MONEY ***" if config.mode == "live" else "")
-    bot.run()
-    return 0
+    return bot.run()
 
 
 if __name__ == "__main__":

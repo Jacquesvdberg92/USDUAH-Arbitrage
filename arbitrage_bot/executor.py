@@ -5,8 +5,13 @@ gone, it simply doesn't fill and we hold nothing. Once we hold an
 intermediate asset we *must* get back to the home asset, so legs 2 and 3 try
 an IOC at the planned price first and then sweep any remainder with a market
 order. Each leg is sized from what the previous leg actually returned (after
-fees), never from a fixed quantity. If a later leg fails, the position is
-unwound straight back to the home asset.
+fees), never from a fixed quantity. If a later leg is rejected, the position
+is unwound straight back to the home asset.
+
+Only *definite* rejections reach the handlers here: an order whose outcome is
+unknown is resolved by LiveExchange, or raises OrderStatusUnknown. Whatever
+exception ends a cycle early carries the partial CycleResult as
+``err.cycle_result``, so the bot can still record what was traded.
 """
 
 from __future__ import annotations
@@ -19,7 +24,7 @@ from typing import Dict, List, Optional
 
 import requests
 
-from .exchange import BinanceAPIError, Exchange, OrderResult
+from .exchange import BinanceAPIError, Exchange, OrderResult, OrderStatusUnknown
 from .market import BUY, SELL, ZERO
 from .triangle import CyclePlan, Leg, PairIndex
 
@@ -47,8 +52,8 @@ class LegExecution:
 
 @dataclass
 class CycleResult:
-    plan: CyclePlan
-    status: str  # completed | no_fill | unwound
+    plan: Optional[CyclePlan]  # None for housekeeping orders (dust sweeps)
+    status: str  # completed | no_fill | unwound | stuck | unknown | interrupted
     legs: List[LegExecution] = field(default_factory=list)
     home_spent: Decimal = ZERO
     home_received: Decimal = ZERO
@@ -63,12 +68,13 @@ class CycleResult:
         return self.home_received - self.home_spent
 
     def to_dict(self) -> dict:
+        plan = self.plan
         return {
-            "cycle": self.plan.cycle.path,
+            "cycle": plan.cycle.path if plan else None,
             "status": self.status,
-            "planned_spent": str(self.plan.spent),
-            "planned_profit": str(self.plan.profit),
-            "planned_profit_bps": str(round(self.plan.profit_bps, 3)),
+            "planned_spent": str(plan.spent) if plan else None,
+            "planned_profit": str(plan.profit) if plan else None,
+            "planned_profit_bps": str(round(plan.profit_bps, 3)) if plan else None,
             "home_spent": str(self.home_spent),
             "home_received": str(self.home_received),
             "pnl": str(self.pnl),
@@ -98,14 +104,24 @@ class CycleExecutor:
         result = CycleResult(plan, "no_fill")
         try:
             self._run(plan, result)
+        except BaseException as err:
+            if isinstance(err, StuckPositionError):
+                result.status = "stuck"
+            elif isinstance(err, OrderStatusUnknown):
+                result.status = "unknown"
+            elif not isinstance(err, TRADING_ERRORS) or result.legs:
+                result.status = "interrupted"
+            result.error = f"{result.error}; {err}" if result.error else str(err)
+            err.cycle_result = result  # type: ignore[attr-defined]
+            raise
         finally:
             result.elapsed_ms = (time.monotonic() - started) * 1000
         return result
 
     def _run(self, plan: CyclePlan, result: CycleResult) -> None:
         first = plan.legs[0]
-        # Entry: exactly the planned size and worst price. API errors here leave
-        # us flat, so they propagate to the bot's error handling.
+        # Entry: exactly the planned size and worst price. A definite rejection
+        # here leaves us flat, so it propagates to the bot's error handling.
         order = self.exchange.limit_ioc(first.leg.symbol, first.leg.side, first.base_qty, first.limit_price)
         entry = self._summarise(first.leg, [order], result)
         result.home_spent = entry.spent
@@ -124,7 +140,11 @@ class CycleExecutor:
                 result.status = "unwound"
                 spent = ZERO
                 if self._tradable(held_asset, held):
-                    spent, result.home_received = self.unwind(held_asset, held, result)
+                    try:
+                        spent, result.home_received = self.unwind(held_asset, held, result)
+                    except StuckPositionError:
+                        _add(result.dust, held_asset, held)  # still ours: keep it in the books
+                        raise
                 # else: e.g. leg 1 only partly filled, below Binance's minimum order - keep it as dust
                 _add(result.dust, held_asset, held - spent)
                 return
@@ -198,7 +218,7 @@ class CycleExecutor:
             order = place(rules.symbol, size)
         except TRADING_ERRORS as err:
             raise StuckPositionError(asset, amount, err) from err
-        execution = self._summarise(leg, [order], result or CycleResult(None, "unwound"))  # type: ignore[arg-type]
+        execution = self._summarise(leg, [order], result if result is not None else CycleResult(None, "unwound"))
         return execution.spent, execution.received
 
     def _tradable(self, asset: str, amount: Decimal) -> bool:
@@ -216,5 +236,7 @@ class CycleExecutor:
         if ticker is None:
             return False
         if asset == rules.base:
-            return rules.order_error(rules.round_qty(amount), ticker.bid, market=True) is None
+            return ticker.bid > 0 and rules.order_error(rules.round_qty(amount), ticker.bid, market=True) is None
+        if ticker.ask <= 0:
+            return False  # empty book - e.g. the market is halted
         return rules.order_error(rules.round_qty(amount / ticker.ask), ticker.ask, market=True) is None

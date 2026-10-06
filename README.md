@@ -37,11 +37,30 @@ Every `poll_interval_sec` it:
      because once you hold an intermediate currency you need to get back to the home asset.
    - If a later leg fails, the position is **unwound** straight back to the home asset.
 4. **Tracks** realised P&L, dust and stats. It writes every cycle to `trades.jsonl` and converts
-   dust back to the home asset once there's enough to trade.
+   dust back to the home asset once there's enough to trade. Fees charged in BNB are valued in
+   the home asset and count against P&L and the risk limits too.
 
-**Risk limits.** The bot stops on any of: a cumulative loss limit, N losing cycles in a row,
-N API errors in a row (with backoff, and honouring `Retry-After`), `max_cycles`, or a position
-it couldn't unwind. Trade size is also capped by `max_trade` and by a fraction of your balance.
+**When an order's fate is unknown.** A timeout, an HTTP 5xx or Binance error -1006/-1007 does
+*not* mean the order failed: it may have executed. Every order carries its own client order ID.
+If one of those errors happens, the bot looks the order up and uses its real fills. If Binance
+still can't say what happened, the bot stops instead of guessing.
+
+**Risk limits.** The bot stops on any of:
+- a cumulative loss limit
+- N losing cycles in a row
+- N API errors in a row (with backoff, and honouring `Retry-After`)
+- N rejected orders in a row
+- an API key without trading permission
+- `max_cycles`
+- a position it couldn't unwind, or an order whose outcome it couldn't determine
+
+Trade size is also capped by `max_trade` and by a fraction of your balance. Any cycle that
+ends a run early is still written to `trades.jsonl`.
+
+**Stopping it.** Pressing Ctrl+C while orders are in flight lets the current cycle finish first,
+so no position is left half-done; press it again to force an exit. The process exits with code
+`2` when it stopped for a reason that needs a human (loss limit, stuck position, unknown order,
+repeated errors), so a supervisor such as systemd or cron can alert you. A normal stop exits `0`.
 
 ## Modes
 
@@ -52,8 +71,9 @@ it couldn't unwind. Trade size is also capped by `max_trade` and by a fraction o
 | `live` | Binance | **real orders, real money**; also requires `--confirm-live` | `BINANCE_API_KEY` / `_SECRET` |
 
 Paper mode re-fetches the book for every simulated order, so prices that move while the legs are
-in flight affect the result. It also enforces the same filters and balance checks as Binance.
-What it **can't** model is a faster bot taking the liquidity first, so treat paper results as an
+in flight affect the result. It also enforces the same filters and balance checks as Binance, and
+it remembers the liquidity it has "taken", so it can't trade the same resting order twice. What it
+**can't** model is a faster bot taking the liquidity first, so treat paper results as an
 upper bound. The testnet has few symbols and unrealistic books; use it to check your keys and
 order plumbing, not profitability.
 
@@ -97,9 +117,10 @@ Keys are read only from the environment. `config.json`, `.env`, logs and trade l
 | `poll_interval_sec` / `cooldown_sec` | 1 / 2 | time between scans / pause after a trade |
 | `max_depth_checks_per_scan` | 3 | at most this many full-depth checks per scan |
 | `max_cycles` | 0 | stop after this many cycles (0 = never) |
-| `max_loss` | 5 | stop when realised P&L plus dust falls this far below zero (home asset) |
-| `max_consecutive_losses` / `max_consecutive_errors` | 5 / 5 | stop conditions |
+| `max_loss` | 5 | stop when realised P&L, minus fees paid in other assets, plus dust falls this far below zero (home asset) |
+| `max_consecutive_losses` / `max_consecutive_errors` | 5 / 5 | stop conditions (the error limit also applies to rejected orders) |
 | `paper_balances` | `{"USDT": 1000}` | starting balances in paper mode |
+| `paper_depletion_sec` | 60 | how long paper mode remembers liquidity it already took |
 | `log_file` / `trade_log` | `arbitrage.log` / `trades.jsonl` | where output goes (`""` disables) |
 
 ## Will it make money? Be realistic
