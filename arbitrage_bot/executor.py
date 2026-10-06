@@ -111,7 +111,10 @@ class CycleExecutor:
                 result.status = "unknown"
             elif not isinstance(err, TRADING_ERRORS) or result.legs:
                 result.status = "interrupted"
-            result.error = f"{result.error}; {err}" if result.error else str(err)
+            if result.status != "no_fill":
+                self._settle_from_orders(result)
+            message = str(err) or type(err).__name__
+            result.error = f"{result.error}; {message}" if result.error else message
             err.cycle_result = result  # type: ignore[attr-defined]
             raise
         finally:
@@ -140,11 +143,7 @@ class CycleExecutor:
                 result.status = "unwound"
                 spent = ZERO
                 if self._tradable(held_asset, held):
-                    try:
-                        spent, result.home_received = self.unwind(held_asset, held, result)
-                    except StuckPositionError:
-                        _add(result.dust, held_asset, held)  # still ours: keep it in the books
-                        raise
+                    spent, result.home_received = self.unwind(held_asset, held, result)
                 # else: e.g. leg 1 only partly filled, below Binance's minimum order - keep it as dust
                 _add(result.dust, held_asset, held - spent)
                 return
@@ -155,8 +154,16 @@ class CycleExecutor:
         result.home_received = held
 
     def _complete_leg(self, leg: Leg, amount_in: Decimal, limit: Decimal, result: CycleResult) -> LegExecution:
-        rules = self.rules[leg.symbol]
         orders: List[OrderResult] = []
+        try:
+            self._place_leg(leg, amount_in, limit, orders)
+        except BaseException:
+            self._summarise(leg, orders, result)  # keep whatever already executed in the books
+            raise
+        return self._summarise(leg, orders, result)
+
+    def _place_leg(self, leg: Leg, amount_in: Decimal, limit: Decimal, orders: List[OrderResult]) -> None:
+        rules = self.rules[leg.symbol]
         if leg.side == SELL:
             qty = rules.round_qty(amount_in)
             if rules.order_error(qty, limit) is None:
@@ -176,7 +183,6 @@ class CycleExecutor:
                 and rules.order_error(rules.round_qty(remaining / limit), limit, market=True) is None
             ):
                 orders += self._fallback(self.exchange.market_buy_quote, leg.symbol, remaining)
-        return self._summarise(leg, orders, result)
 
     def _fallback(self, place, symbol: str, amount: Decimal) -> List[OrderResult]:
         """Market order for the remainder. A failure here is logged, not raised:
@@ -186,6 +192,17 @@ class CycleExecutor:
         except TRADING_ERRORS as err:
             log.warning("market fallback on %s failed: %s", symbol, err)
             return []
+
+    def _settle_from_orders(self, result: CycleResult) -> None:
+        """Rebuild a cut-short cycle's books from the orders that actually executed:
+        home asset in/out, and every other asset still held (an open position)."""
+        net: Dict[str, Decimal] = {}
+        for execution in result.legs:
+            _add(net, execution.leg.from_asset, -execution.spent)
+            _add(net, execution.leg.to_asset, execution.received)
+        result.home_spent = sum((e.spent for e in result.legs if e.leg.from_asset == self.home), ZERO)
+        result.home_received = sum((e.received for e in result.legs if e.leg.to_asset == self.home), ZERO)
+        result.dust = {asset: amount for asset, amount in net.items() if asset != self.home and amount > 0}
 
     def _summarise(self, leg: Leg, orders: List[OrderResult], result: CycleResult) -> LegExecution:
         rules = self.rules[leg.symbol]

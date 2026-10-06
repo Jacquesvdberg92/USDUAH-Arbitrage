@@ -173,7 +173,10 @@ def simulate_leg(
         # A LIMIT buy reserves qty x limit price (the worst level), not the
         # average cost, so the order has to fit the budget at that price.
         while fill.base_qty > 0 and fill.base_qty * fill.worst_price > amount_in:
-            fill = fill_buy(book.asks, rules.round_qty(amount_in / fill.worst_price))
+            qty = rules.round_qty(amount_in / fill.worst_price)
+            if qty >= fill.base_qty:  # Decimal rounding at the 28th digit: step down explicitly
+                qty = fill.base_qty - rules.step_size if rules.step_size > 0 else ZERO
+            fill = fill_buy(book.asks, qty)
         gross, spent = fill.base_qty, fill.quote_qty
     else:
         qty = rules.round_qty(amount_in)

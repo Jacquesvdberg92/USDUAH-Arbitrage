@@ -57,10 +57,12 @@ still can't say what happened, the bot stops instead of guessing.
 Trade size is also capped by `max_trade` and by a fraction of your balance. Any cycle that
 ends a run early is still written to `trades.jsonl`.
 
-**Stopping it.** Pressing Ctrl+C while orders are in flight lets the current cycle finish first,
-so no position is left half-done; press it again to force an exit. The process exits with code
-`2` when it stopped for a reason that needs a human (loss limit, stuck position, unknown order,
-repeated errors), so a supervisor such as systemd or cron can alert you. A normal stop exits `0`.
+**Stopping it.** Pressing Ctrl+C while orders are in flight lets the current cycle (and its
+bookkeeping) finish first, so no position is left half-done. Pressing it again forces an exit; the
+cycle is then logged as `interrupted` with whatever it still held. The process exits with code `2`
+when it stopped for a reason that needs a human, so a supervisor such as systemd or cron can alert
+you. Those reasons are: loss limit, stuck position, unknown order, repeated errors, or a forced
+exit mid-cycle. A normal stop exits `0`.
 
 ## Modes
 

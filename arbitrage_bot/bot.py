@@ -43,6 +43,7 @@ class Stats:
     cycles: int = 0
     no_fills: int = 0
     unwinds: int = 0
+    unresolved: int = 0  # cut short by an unknown order outcome or a forced Ctrl+C
     wins: int = 0
     losses: int = 0
     pnl: Decimal = ZERO  # realised change in the home asset
@@ -82,6 +83,7 @@ class ArbitrageBot:
         self.consecutive_errors = 0
         self.consecutive_order_errors = 0
         self.stop_requested = False
+        self.open_position_warning: Optional[str] = None  # set when a cut-short cycle may have left a position
 
     # -- one scan ---------------------------------------------------------
     def step(self) -> Optional[CycleResult]:
@@ -129,25 +131,25 @@ class ArbitrageBot:
                 "OPPORTUNITY %s: spend %.4f %s, expect %+.4f (%.2f bps; top-of-book %.2f bps)",
                 cycle.path, plan.spent, self.home, plan.profit, plan.profit_bps, edge,
             )
-            result = self._execute(plan)
-            self._record(result)
+            with self._defer_interrupt():  # orders and their bookkeeping happen as one unit
+                result = self._execute(plan)
+                self._record(result)
             return result
         return None
 
     def _execute(self, plan: CyclePlan) -> CycleResult:
-        with self._defer_interrupt():
-            try:
-                result = self.executor.execute(plan)
-            except TRADING_ERRORS as err:
-                self._order_rejected(err)  # leg 1 was definitely rejected: we're still flat
-                raise
-            except (StuckPositionError, OrderStatusUnknown) as err:
-                self._record_partial(err)
-                kind = "STUCK POSITION" if isinstance(err, StuckPositionError) else "ORDER STATUS UNKNOWN"
-                raise StopTrading(f"{kind} - check your Binance account: {err}") from err
-            except BaseException as err:  # Ctrl+C pressed twice, or a bug: still record what traded
-                self._record_partial(err)
-                raise
+        try:
+            result = self.executor.execute(plan)
+        except TRADING_ERRORS as err:
+            self._order_rejected(err)  # leg 1 was definitely rejected: we're still flat
+            raise
+        except (StuckPositionError, OrderStatusUnknown) as err:
+            self._record_partial(err)
+            kind = "STUCK POSITION" if isinstance(err, StuckPositionError) else "ORDER STATUS UNKNOWN"
+            raise StopTrading(f"{kind} - check your Binance account: {err}") from err
+        except BaseException as err:  # Ctrl+C pressed twice, or a bug: still record what traded
+            self._record_partial(err)
+            raise
         self.consecutive_order_errors = 0
         return result
 
@@ -227,14 +229,22 @@ class ArbitrageBot:
             stats.no_fills += 1
             log.info("  no fill on entry (%.0f ms) - the opportunity was already gone", result.elapsed_ms)
         else:
+            stats.pnl += result.pnl
+            for asset, amount in result.dust.items():
+                self.dust[asset] = self.dust.get(asset, ZERO) + amount
+        if result.status in ("unknown", "interrupted"):
+            # We don't know how this cycle ended, so it is neither a win nor a loss.
+            stats.unresolved += 1
+            log.error(
+                "  %s after %.0f ms: realised %+.6f %s so far, still holding %s - check your Binance account",
+                result.status.upper(), result.elapsed_ms, result.pnl, self.home, result.dust or "nothing we know of",
+            )
+        elif result.status != "no_fill":
             stats.cycles += 1
             if result.status == "unwound":
                 stats.unwinds += 1
-            stats.pnl += result.pnl
             if result.plan is not None:
                 stats.planned_pnl += result.plan.profit
-            for asset, amount in result.dust.items():
-                self.dust[asset] = self.dust.get(asset, ZERO) + amount
             if result.pnl - fee_value + dust_value < 0:
                 stats.losses += 1
                 self.consecutive_losses += 1
@@ -260,6 +270,8 @@ class ArbitrageBot:
         partial = getattr(err, "cycle_result", None)
         if partial is None:
             return
+        if partial.status in ("stuck", "unknown", "interrupted"):
+            self.open_position_warning = f"{partial.status} cycle, holding {partial.dust or 'unknown'}"
         try:
             self._record(partial, final=True)
         except Exception as record_err:  # never let bookkeeping hide the original problem
@@ -321,7 +333,7 @@ class ArbitrageBot:
         return (
             f"{minutes:.1f} min | scans {s.scans} | screened {s.screened} | depth checks {s.depth_checks} | "
             f"qualified {s.qualified} | cycles {s.cycles} (won {s.wins}, lost {s.losses}, unwound {s.unwinds}, "
-            f"no-fill {s.no_fills}) | realised P&L {s.pnl:+.6f} {self.home} (planned {s.planned_pnl:+.6f}) | "
+            f"no-fill {s.no_fills}, unresolved {s.unresolved}) | realised P&L {s.pnl:+.6f} {self.home} (planned {s.planned_pnl:+.6f}) | "
             f"other-asset fees ~{s.fees_value:.6f} | dust ~{self.dust_value():.6f} | "
             f"net ~{self.equity_change():+.6f} {self.home} | errors {s.errors} | "
             f"best top-of-book edge{' (whole run)' if whole_run else ''} {best}"
@@ -346,6 +358,8 @@ class ArbitrageBot:
                 except (StuckPositionError, OrderStatusUnknown) as err:  # e.g. from a dust sweep
                     raise StopTrading(f"check your Binance account: {err}") from err
                 except TRADING_ERRORS as err:
+                    if self.stop_requested:  # Ctrl+C arrived while the rejected entry order was in flight
+                        raise StopTrading("stopped by Ctrl+C (entry order was rejected, nothing held)", fatal=False) from err
                     self._handle_error(err)
                     continue
                 if self.stop_requested:
@@ -362,7 +376,11 @@ class ArbitrageBot:
             else:
                 log.info("stopping: %s", stop)
         except KeyboardInterrupt:
-            log.info("interrupted")
+            if self.open_position_warning:
+                log.error("INTERRUPTED mid-cycle (%s) - check your Binance account", self.open_position_warning)
+                exit_code = 2
+            else:
+                log.info("interrupted")
         finally:
             log.info("FINAL %s", self.summary(whole_run=True))
         return exit_code

@@ -20,6 +20,7 @@ from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, 
 from urllib.parse import urlencode
 
 import requests
+from urllib3.exceptions import NewConnectionError
 
 from .market import (
     BUY,
@@ -75,8 +76,11 @@ def is_definite_rejection(err: Exception) -> bool:
     """True when we know for certain that a failed order did NOT execute."""
     if isinstance(err, BinanceAPIError):
         return err.status < 500 and err.code not in UNKNOWN_OUTCOME_CODES
-    # Couldn't even connect, so the order never left this machine.
-    return isinstance(err, requests.ConnectTimeout)
+    # Couldn't even connect (timeout, refused, DNS failure), so the order never left this machine.
+    if isinstance(err, requests.ConnectTimeout):
+        return True
+    reason = getattr(err.args[0], "reason", None) if isinstance(err, requests.ConnectionError) and err.args else None
+    return isinstance(reason, NewConnectionError)
 
 
 def sign(secret: str, query: str) -> str:

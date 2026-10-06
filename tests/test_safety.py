@@ -11,7 +11,7 @@ import requests
 
 from arbitrage_bot import __main__ as cli
 from arbitrage_bot.bot import ArbitrageBot
-from arbitrage_bot.exchange import BinanceAPIError, LiveExchange, OrderResult, PaperExchange
+from arbitrage_bot.exchange import BinanceAPIError, LiveExchange, OrderResult, OrderStatusUnknown, PaperExchange
 from arbitrage_bot.executor import CycleExecutor, CycleResult
 from arbitrage_bot.triangle import plan_cycle
 
@@ -35,9 +35,10 @@ class FakeLiveClient:
         result = self.paper._place({k: v for k, v in params.items() if k != "newClientOrderId"})
         raw = dict(result.raw, clientOrderId=params["newClientOrderId"])
         self.orders[params["newClientOrderId"]] = raw
-        if params["symbol"] in self.lose:
-            self.lose.remove(params["symbol"])
-            raise requests.ReadTimeout("read timed out")
+        for key in (params["symbol"], (params["symbol"], params["type"])):
+            if key in self.lose:
+                self.lose.remove(key)
+                raise requests.ReadTimeout("read timed out")
         return OrderResult.from_api(raw)
 
     def get_order(self, symbol, client_order_id):
@@ -235,3 +236,105 @@ def test_trade_log_write_failure_does_not_crash(config, paper, index, cycles, fe
     config.trade_log = str(tmp_path / "missing-dir" / "trades.jsonl")
     bot = ArbitrageBot(config, paper, CycleExecutor(paper, index, "USDT"), cycles, fees, sleep=lambda s: None)
     assert bot.step().status == "completed"
+
+
+# -- follow-up review: interrupted / unknown cycles ---------------------------------
+
+def test_ctrl_c_during_a_rejected_entry_stops_without_another_cycle(config, market, index, cycles, rules, fees):
+    class InterruptThenReject(PaperExchange):
+        sent = 0
+
+        def _place(self, params):
+            self.sent += 1
+            if self.sent == 1:
+                os.kill(os.getpid(), signal.SIGINT)
+                raise BinanceAPIError(400, -2010, "Order rejected.")
+            return super()._place(params)
+
+    paper = InterruptThenReject(market, rules, fees, {"USDT": D("1000")})
+    bot = ArbitrageBot(config, paper, CycleExecutor(paper, index, "USDT"), cycles, fees, sleep=lambda s: None)
+    assert bot.run() == 0 and paper.sent == 1
+
+
+def test_forced_exit_mid_cycle_keeps_the_open_position_in_the_books(config, market, index, cycles, rules, fees):
+    class ForceQuitOnLeg2(PaperExchange):
+        def _place(self, params):
+            if params["symbol"] == "EURUSDC":
+                os.kill(os.getpid(), signal.SIGINT)  # "finish the cycle first"...
+                os.kill(os.getpid(), signal.SIGINT)  # ...no, quit now
+            return super()._place(params)
+
+    paper = ForceQuitOnLeg2(market, rules, fees, {"USDT": D("1000")})
+    bot = ArbitrageBot(config, paper, CycleExecutor(paper, index, "USDT"), cycles, fees, sleep=lambda s: None)
+    assert bot.run() == 2  # a human should look: a position is open
+    row = json.loads(open(config.trade_log).read().splitlines()[-1])
+    assert row["status"] == "interrupted" and row["dust"] == {"USDC": "99.9"} and row["error"] == "KeyboardInterrupt"
+    assert (bot.stats.unresolved, bot.stats.wins, bot.stats.losses) == (1, 0, 0)
+    assert D("-0.3") < bot.equity_change() < 0  # not -100: the USDC is still ours
+    assert paper.balances()["USDC"] == D("99.9")
+
+
+def test_unknown_entry_order_is_unresolved_not_a_win(config, paper, index, cycles, rules, fees):
+    client = FakeLiveClient(paper, lose_response_for=["USDCUSDT"], lookup_fails=True)
+    exchange = live_exchange(client, rules)
+    bot = ArbitrageBot(config, exchange, CycleExecutor(exchange, index, "USDT"), cycles, fees, sleep=lambda s: None)
+    assert bot.run() == 2
+    assert (bot.stats.unresolved, bot.stats.wins, bot.stats.planned_pnl) == (1, 0, 0)
+
+
+def test_unknown_market_fallback_keeps_the_ioc_fill(paper, market, index, cycles, rules, fees):
+    plan = plan_for(cycles, rules, fees)
+    market.books["EURUSDT"] = make_book("EURUSDT", [(1.1050, 50), (1.1040, 5000)], [(1.1051, 5000)])
+    client = FakeLiveClient(paper, lose_response_for=[("EURUSDT", "MARKET")], lookup_fails=True)
+    with pytest.raises(OrderStatusUnknown) as err:
+        CycleExecutor(live_exchange(client, rules), index, "USDT").execute(plan)
+    result = err.value.cycle_result
+    assert result.status == "unknown"
+    assert [o.order_type for leg in result.legs for o in leg.orders] == ["LIMIT", "LIMIT", "LIMIT"]
+    assert result.home_received == D("55.25") * D("0.999")  # the IOC part of leg 3 is in the books
+    # The EUR the fallback tried to sell may or may not still be there; USDC is leg 2's rounding leftover.
+    assert result.dust == {"EUR": D("90.7092") - 50, "USDC": D("0.01092")}
+
+
+def test_ctrl_c_during_post_trade_bookkeeping_still_books_the_sweep(config, market, index, cycles, rules, fees):
+    class InterruptAfterSweep(PaperExchange):
+        def _place(self, params):
+            result = super()._place(params)
+            if params["type"] == "MARKET" and params["symbol"] == "USDCUSDT":
+                os.kill(os.getpid(), signal.SIGINT)  # the sweep order executed; Ctrl+C before it's booked
+            return result
+
+    paper = InterruptAfterSweep(market, rules, fees, {"USDT": D("1000"), "USDC": D("50")})
+    bot = ArbitrageBot(config, paper, CycleExecutor(paper, index, "USDT"), cycles, fees, sleep=lambda s: None)
+    bot.dust["USDC"] = D("50")  # leftovers from earlier cycles, big enough to sweep
+    assert bot.run() == 0
+    assert bot.stats.cycles == 1 and len(open(config.trade_log).read().splitlines()) == 1
+    assert bot.dust["USDC"] < 1  # the sweep is in the books...
+    assert bot.stats.pnl > 49  # ...and so are its proceeds
+
+
+def test_failure_to_connect_is_a_definite_rejection():
+    import urllib3
+    from arbitrage_bot.exchange import is_definite_rejection
+
+    session = requests.Session()
+    session.trust_env = False  # no proxy: really try 127.0.0.1:1
+    with pytest.raises(requests.ConnectionError) as refused:
+        session.post("http://127.0.0.1:1/api/v3/order", timeout=2)
+    assert is_definite_rejection(refused.value)  # connection refused: never sent
+    assert is_definite_rejection(requests.ConnectTimeout())
+    assert not is_definite_rejection(requests.ReadTimeout())  # sent, answer lost
+    assert not is_definite_rejection(requests.ConnectionError(urllib3.exceptions.ProtocolError("reset")))
+    assert not is_definite_rejection(BinanceAPIError(503, -1001, "Internal error"))
+    assert not is_definite_rejection(BinanceAPIError(408, -1007, "Timeout waiting for response"))
+    assert is_definite_rejection(BinanceAPIError(429, -1003, "Too many requests"))
+
+
+def test_buy_sizing_terminates_on_decimal_rounding_edge():
+    from arbitrage_bot.triangle import Leg, simulate_leg
+
+    rules = make_rules("XQ", "X", "Q", step="0.01", min_qty="0.01", min_notional="1")
+    book = make_book("XQ", [(43.03, 100)], [(43.04, 100)])
+    # One unit in the 28th digit below 1.23 x 43.04: Decimal division rounds back up to 1.23.
+    plan = simulate_leg(Leg("XQ", "BUY", "Q", "X"), rules, book, D("52.93919999999999999999999999"), D("0"))
+    assert plan.base_qty == D("1.22")
