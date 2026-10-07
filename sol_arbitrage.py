@@ -1,288 +1,561 @@
-from binance.client import Client
-from decimal import Decimal, ROUND_DOWN
-from tkinter import ttk, messagebox, scrolledtext
+"""SOL Arbitrage: a window around arb_engine.py.
+
+Run:  python sol_arbitrage.py
+Put your Binance API key/secret in key.py for real fees, balances and live trading.
+Without keys it runs on public market data in dry run (paper trading) mode.
+"""
+import math
 import queue
 import threading
 import time
 import tkinter as tk
+from tkinter import ttk, messagebox, font as tkfont
+
+import arb_engine as E
 import key
 
-#Coin to arbitrage, and the stablecoins it is quoted in
-COIN = 'SOL'
-QUOTES = ['USDT', 'FDUSD', 'USDC']
+# colours (dark theme, Solana accents)
+BG, PANEL, FIELD, BORDER = '#0d1117', '#161b22', '#0b0f14', '#2a313c'
+TEXT, MUTED, DIM = '#e6edf3', '#8b949e', '#5b636d'
+PURPLE, PURPLE_HI, GREEN, RED, AMBER, BLUE = '#9945ff', '#ad6bff', '#3fb950', '#f85149', '#d29922', '#58a6ff'
 
-#Per-symbol fee overrides, e.g. fee_overrides = {'SOLFDUSD': 0.0} in key.py
-FEE_OVERRIDES = getattr(key, 'fee_overrides', {})
+FIELDS = [  # key, label, hint
+    ('size', 'Trade size', 'Amount of the starting stablecoin spent per trade'),
+    ('min_profit', 'Min profit %', 'Only trade if the route still makes this much when every\n'
+                                   'order fills at its worst allowed price, after all fees'),
+    ('interval', 'Check every (s)', 'How often prices are read'),
+    ('fallback_fee', 'Fallback fee %', 'Taker fee per order, used when your real fees\n'
+                                       'cannot be read (no API keys)'),
+    ('cooldown', 'Cooldown (s)', 'Pause after each trade'),
+    ('max_loss', 'Stop at loss ($)', 'Stop the session once it has lost this much'),
+    ('max_trades', 'Max trades', 'Stop the session after this many trades'),
+]
+HISTORY = 300   # points on the chart
 
 
-class Arbitrage:
-    """Prices, route maths and order placing. No UI code in here."""
+class Tooltip:
+    """Small hint shown while the mouse is over a widget."""
 
-    def __init__(self, client):
-        self.client = client
-        self.symbols = {s['symbol']: s for s in client.get_exchange_info()['symbols']
-                        if s['status'] == 'TRADING'}
+    def __init__(self, widget, text, font):
+        self.widget, self.text, self.font, self.tip = widget, text, font, None
+        widget.bind('<Enter>', self.show, add='+')
+        widget.bind('<Leave>', self.hide, add='+')
 
-        #SOL pairs, plus the stablecoin pairs needed to convert between quotes
-        self.watch = [COIN + q for q in QUOTES if COIN + q in self.symbols]
-        for a in QUOTES:
-            for b in QUOTES:
-                pair = self.stable_pair(a, b) if a != b else None
-                if pair and pair[0] not in self.watch:
-                    self.watch.append(pair[0])
+    def show(self, _):
+        x = self.widget.winfo_rootx() + 12
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        self.tip.wm_geometry(f'+{x}+{y}')
+        tk.Label(self.tip, text=self.text, bg='#2d333b', fg=TEXT, font=self.font, padx=8, pady=4).pack()
 
-    def stable_pair(self, frm, to):
-        #(symbol, side) to convert frm -> to, or None if Binance has no such pair
-        if frm + to in self.symbols:
-            return frm + to, 'SELL'
-        if to + frm in self.symbols:
-            return to + frm, 'BUY'
-        return None
+    def hide(self, _):
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
 
-    def fee(self, symbol, settings):
-        return FEE_OVERRIDES.get(symbol, settings['fee'])
 
-    def books(self):
-        #best bid/ask per symbol, None if the book is empty
-        books = {}
-        for s in self.watch:
-            t = self.client.get_orderbook_ticker(symbol=s)
-            bid, ask = float(t['bidPrice']), float(t['askPrice'])
-            if bid <= 0 or ask <= 0:
-                books[s] = None
-            else:
-                books[s] = {'bid': bid, 'bid_qty': float(t['bidQty']),
-                            'ask': ask, 'ask_qty': float(t['askQty'])}
-        return books
-
-    def routes(self, books, settings):
-        #every route a -> SOL -> b -> back to a, with net profit after fees and spread
-        size = settings['size']
-        routes = []
-        for a in QUOTES:
-            for b in QUOTES:
-                if a == b:
-                    continue
-                buy, sell = books.get(COIN + a), books.get(COIN + b)
-                pair = self.stable_pair(b, a)
-                if buy is None or sell is None or pair is None or books.get(pair[0]) is None:
-                    continue
-                conv = books[pair[0]]
-                rate = conv['bid'] if pair[1] == 'SELL' else 1 / conv['ask']
-
-                coin_qty = size / buy['ask'] * (1 - self.fee(COIN + a, settings))
-                b_qty = coin_qty * sell['bid'] * (1 - self.fee(COIN + b, settings))
-                end = b_qty * rate * (1 - self.fee(pair[0], settings))
-
-                #top of book must hold the whole trade, otherwise the market order slips
-                deep = coin_qty <= buy['ask_qty'] and coin_qty <= sell['bid_qty']
-                routes.append({'a': a, 'b': b, 'profit': end / size - 1, 'deep': deep})
-        return routes
-
-    def balance(self, asset):
-        return float(self.client.get_asset_balance(asset=asset)['free'])
-
-    def round_qty(self, symbol, qty):
-        step = Decimal('0.00000001')
-        for f in self.symbols[symbol]['filters']:
-            if f['filterType'] == 'LOT_SIZE':
-                step = Decimal(f['stepSize']).normalize()
-        return str(Decimal(str(qty)).quantize(step, rounding=ROUND_DOWN))
-
-    def round_quote(self, symbol, qty):
-        digits = self.symbols[symbol]['quoteAssetPrecision']
-        return str(Decimal(str(qty)).quantize(Decimal(1).scaleb(-digits), rounding=ROUND_DOWN))
-
-    def market(self, symbol, side, qty=None, quote_qty=None):
-        if quote_qty is not None:
-            return self.client.create_order(symbol=symbol, side=side, type='MARKET',
-                                            quoteOrderQty=self.round_quote(symbol, quote_qty))
-        return self.client.create_order(symbol=symbol, side=side, type='MARKET',
-                                        quantity=self.round_qty(symbol, qty))
-
-    def execute(self, a, b, size):
-        #three market orders: a -> SOL, SOL -> b, b -> a. Returns the order responses.
-        def commission(order, asset):
-            return sum(float(f['commission']) for f in order.get('fills', [])
-                       if f['commissionAsset'] == asset)
-
-        o1 = self.market(COIN + a, 'BUY', quote_qty=size)
-        coin_qty = float(o1['executedQty']) - commission(o1, COIN)
-
-        o2 = self.market(COIN + b, 'SELL', qty=coin_qty)
-        b_qty = float(o2['cummulativeQuoteQty']) - commission(o2, b)
-
-        symbol, side = self.stable_pair(b, a)
-        if side == 'SELL':
-            o3 = self.market(symbol, 'SELL', qty=b_qty)
-        else:
-            o3 = self.market(symbol, 'BUY', quote_qty=b_qty)
-        return [o1, o2, o3]
+def pick_font(*names):
+    available = set(tkfont.families())
+    return next((n for n in names if n in available), 'TkDefaultFont')
 
 
 class App:
     def __init__(self, root):
         self.root = root
-        self.arb = None
         self.events = queue.Queue()
-        self.stop_event = threading.Event()
-        self.thread = None
-        self.logfile = open('log.txt', 'a')
+        self.stop_event = None
+        self.running = False
+        self.history = []
+        self.logfile = open('log.txt', 'a', encoding='utf-8')
+        self.min_profit = E.DEFAULTS['min_profit']
+        self.fees = {}   # symbol -> (buy, sell) taker rate, when read from the account
 
-        root.title(COIN + ' Arbitrage')
-        root.geometry('640x620')
+        root.title('SOL Arbitrage')
+        root.configure(bg=BG)
+        root.geometry('1240x860')
+        root.minsize(1080, 760)
+        self.ui = pick_font('Segoe UI', 'SF Pro Text', 'Helvetica Neue', 'DejaVu Sans', 'Arial')
+        self.mono = pick_font('Cascadia Mono', 'Consolas', 'Menlo', 'DejaVu Sans Mono', 'Courier New')
+        self.style()
 
-        #settings
-        box = ttk.LabelFrame(root, text='Settings', padding=8)
-        box.pack(fill='x', padx=8, pady=(8, 4))
-        self.size = tk.StringVar(value=str(getattr(key, 'size', 100)))
-        self.fee = tk.StringVar(value=str(getattr(key, 'fee', 0.001) * 100))
-        self.min_profit = tk.StringVar(value=str(getattr(key, 'min_profit', 0.0005) * 100))
-        self.interval = tk.StringVar(value=str(getattr(key, 'sleep', 5)))
-        self.dry_run = tk.BooleanVar(value=True)
-        fields = [('Trade size', self.size), ('Fee % per trade', self.fee),
-                  ('Min profit %', self.min_profit), ('Check every (s)', self.interval)]
-        for i, (label, var) in enumerate(fields):
-            ttk.Label(box, text=label).grid(row=0, column=i, sticky='w', padx=4)
-            ttk.Entry(box, textvariable=var, width=12).grid(row=1, column=i, padx=4)
-        ttk.Checkbutton(box, text='Dry run (no real orders)', variable=self.dry_run).grid(
-            row=2, column=0, columnspan=2, sticky='w', padx=4, pady=(6, 0))
-        self.start_btn = ttk.Button(box, text='Start', command=self.start)
-        self.start_btn.grid(row=2, column=2, pady=(6, 0))
-        self.stop_btn = ttk.Button(box, text='Stop', command=self.stop, state='disabled')
-        self.stop_btn.grid(row=2, column=3, pady=(6, 0))
-
-        #prices
-        box = ttk.LabelFrame(root, text='Prices', padding=4)
-        box.pack(fill='x', padx=8, pady=4)
-        self.prices = ttk.Treeview(box, columns=('bid', 'ask'), height=6)
-        self.prices.heading('#0', text='Pair')
-        self.prices.heading('bid', text='Bid')
-        self.prices.heading('ask', text='Ask')
-        self.prices.pack(fill='x')
-
-        #routes
-        box = ttk.LabelFrame(root, text='Routes (net, after fees and spread)', padding=4)
-        box.pack(fill='x', padx=8, pady=4)
-        self.routes = ttk.Treeview(box, columns=('profit', 'note'), height=6)
-        self.routes.heading('#0', text='Route')
-        self.routes.heading('profit', text='Profit')
-        self.routes.heading('note', text='Note')
-        self.routes.column('#0', width=260)
-        self.routes.tag_configure('win', foreground='green')
-        self.routes.tag_configure('loss', foreground='red')
-        self.routes.pack(fill='x')
-
-        #log
-        box = ttk.LabelFrame(root, text='Log', padding=4)
-        box.pack(fill='both', expand=True, padx=8, pady=(4, 8))
-        self.log_box = scrolledtext.ScrolledText(box, height=8, state='disabled')
-        self.log_box.pack(fill='both', expand=True)
+        self.build_header()
+        self.build_cards()
+        body = tk.Frame(root, bg=BG)
+        body.pack(fill='both', expand=True, padx=16, pady=(0, 16))
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(0, weight=1)
+        left = tk.Frame(body, bg=BG)
+        left.grid(row=0, column=0, sticky='ns', padx=(0, 12))
+        right = tk.Frame(body, bg=BG)
+        right.grid(row=0, column=1, sticky='nsew')
+        self.build_settings(left)
+        self.build_account(left)
+        self.build_routes(right)
+        self.build_chart(right)
+        self.build_bottom(right)
 
         root.protocol('WM_DELETE_WINDOW', self.close)
-        root.after(200, self.poll)
+        self.log('Ready. Press Start to watch the market (dry run by default).', 'info')
+        root.after(100, self.poll)
 
-    def log(self, text):
-        line = time.strftime('%H:%M:%S ') + text
-        self.log_box.configure(state='normal')
-        self.log_box.insert('end', line + '\n')
-        self.log_box.see('end')
-        self.log_box.configure(state='disabled')
-        self.logfile.write(line + '\n')
-        self.logfile.flush()
+    # ------------------------------------------------------------------ styling
+    def style(self):
+        s = ttk.Style()
+        s.theme_use('clam')
+        s.configure('.', background=PANEL, foreground=TEXT, font=(self.ui, 10), bordercolor=BORDER,
+                    troughcolor=FIELD, focuscolor=PURPLE)
+        s.configure('Treeview', background=PANEL, fieldbackground=PANEL, foreground=TEXT, rowheight=26,
+                    borderwidth=0, font=(self.ui, 10))
+        s.configure('Treeview.Heading', background=FIELD, foreground=MUTED, relief='flat',
+                    font=(self.ui, 9, 'bold'), padding=(8, 6))
+        s.map('Treeview', background=[('selected', '#262c36')], foreground=[('selected', TEXT)])
+        s.map('Treeview.Heading', background=[('active', FIELD)])
+        s.layout('Treeview', [('Treeview.treearea', {'sticky': 'nswe'})])
+        s.configure('TEntry', fieldbackground=FIELD, foreground=TEXT, insertcolor=TEXT, bordercolor=BORDER,
+                    lightcolor=BORDER, darkcolor=BORDER, padding=(6, 4))
+        s.map('TEntry', bordercolor=[('focus', PURPLE)], lightcolor=[('focus', PURPLE)],
+              fieldbackground=[('disabled', PANEL)], foreground=[('disabled', MUTED)])
+        s.configure('Start.TButton', background=PURPLE, foreground='white', font=(self.ui, 11, 'bold'),
+                    padding=(10, 9), borderwidth=0)
+        s.map('Start.TButton', background=[('disabled', '#3a2d55'), ('active', PURPLE_HI)],
+              foreground=[('disabled', MUTED)])
+        s.configure('Stop.TButton', background='#30363d', foreground=TEXT, font=(self.ui, 11, 'bold'),
+                    padding=(10, 9), borderwidth=0)
+        s.map('Stop.TButton', background=[('disabled', '#1f242b'), ('active', '#3d444d')],
+              foreground=[('disabled', DIM)])
+        s.configure('Link.TButton', background=PANEL, foreground=MUTED, borderwidth=0, padding=(0, 2),
+                    font=(self.ui, 9, 'underline'))
+        s.map('Link.TButton', background=[('active', PANEL)], foreground=[('active', TEXT)])
+        s.configure('TRadiobutton', background=PANEL, foreground=TEXT, indicatorcolor=FIELD,
+                    font=(self.ui, 10))
+        s.map('TRadiobutton', background=[('active', PANEL)], indicatorcolor=[('selected', PURPLE)])
+        s.configure('TNotebook', background=BG, borderwidth=1, tabmargins=0, bordercolor=BORDER,
+                    lightcolor=BORDER, darkcolor=BORDER)
+        s.configure('TNotebook.Tab', background=BG, foreground=MUTED, padding=(14, 6), borderwidth=1,
+                    font=(self.ui, 10, 'bold'), bordercolor=BORDER, lightcolor=BG, darkcolor=BORDER)
+        s.map('TNotebook.Tab', background=[('selected', PANEL)], foreground=[('selected', TEXT)],
+              lightcolor=[('selected', PANEL)])
+        s.configure('Vertical.TScrollbar', background=BORDER, troughcolor=PANEL, bordercolor=PANEL,
+                    arrowcolor=MUTED, lightcolor=BORDER, darkcolor=BORDER, gripcount=0)
+        s.map('Vertical.TScrollbar', background=[('active', '#3d444d'), ('!active', BORDER)])
+
+    def card(self, parent, title, **pack):
+        outer = tk.Frame(parent, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        outer.pack(**pack)
+        if title:
+            tk.Label(outer, text=title.upper(), bg=PANEL, fg=MUTED, font=(self.ui, 9, 'bold')).pack(
+                anchor='w', padx=14, pady=(12, 6))
+        return outer
+
+    def pill(self, parent, text, colour):
+        p = tk.Label(parent, text=text, bg=PANEL, fg=colour, font=(self.ui, 9, 'bold'), padx=10, pady=4,
+                     highlightthickness=1, highlightbackground=BORDER)
+        p.pack(side='right', padx=(8, 0))
+        return p
+
+    def set_pill(self, p, text, colour):
+        p.configure(text=text, fg=colour)
+
+    # ------------------------------------------------------------------ layout
+    def build_header(self):
+        h = tk.Frame(self.root, bg=BG)
+        h.pack(fill='x', padx=16, pady=(14, 10))
+        logo = tk.Canvas(h, width=34, height=34, bg=BG, highlightthickness=0)
+        logo.pack(side='left')
+        for i, c in enumerate((GREEN, BLUE, PURPLE)):
+            y = 8 + i * 8
+            logo.create_polygon(8, y + 5, 12, y, 30, y, 26, y + 5, fill=c, outline='')
+        t = tk.Frame(h, bg=BG)
+        t.pack(side='left', padx=(8, 0))
+        tk.Label(t, text='SOL Arbitrage', bg=BG, fg=TEXT, font=(self.ui, 17, 'bold')).pack(anchor='w')
+        tk.Label(t, text='USDT · FDUSD · USDC triangle on Binance spot', bg=BG, fg=MUTED,
+                 font=(self.ui, 10)).pack(anchor='w')
+        pills = tk.Frame(h, bg=BG)
+        pills.pack(side='right')
+        self.p_data = self.pill(pills, 'NO DATA', DIM)
+        self.p_fees = self.pill(pills, 'FEES: —', DIM)
+        self.p_state = self.pill(pills, '○ STOPPED', MUTED)
+        self.p_mode = self.pill(pills, 'DRY RUN', AMBER)
+
+    def build_cards(self):
+        row = tk.Frame(self.root, bg=BG)
+        row.pack(fill='x', padx=16, pady=(0, 12))
+        self.cards = {}
+        for i, (k, title) in enumerate((('best', 'Best route now'), ('trigger', 'Trigger at'),
+                                        ('checks', 'Price checks'), ('trades', 'Trades'),
+                                        ('pnl', 'Session P&L'))):
+            row.columnconfigure(i, weight=1, uniform='cards')
+            c = tk.Frame(row, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+            c.grid(row=0, column=i, sticky='nsew', padx=(0 if i == 0 else 10, 0))
+            tk.Label(c, text=title.upper(), bg=PANEL, fg=MUTED, font=(self.ui, 9, 'bold')).pack(
+                anchor='w', padx=14, pady=(12, 0))
+            v = tk.Label(c, text='—', bg=PANEL, fg=TEXT, font=(self.ui, 20, 'bold'))
+            v.pack(anchor='w', padx=14)
+            sub = tk.Label(c, text=' ', bg=PANEL, fg=MUTED, font=(self.ui, 9))
+            sub.pack(anchor='w', padx=14, pady=(0, 12))
+            self.cards[k] = (v, sub)
+        self.set_card('trigger', f'+{self.min_profit:.2f}%', 'worst-case net profit')
+        self.set_card('trades', '0', 'none yet')
+        self.set_card('pnl', '$0.00', 'paper trading')
+
+    def set_card(self, k, value, sub=None, colour=TEXT):
+        v, s = self.cards[k]
+        v.configure(text=value, fg=colour)
+        if sub is not None:
+            s.configure(text=sub)
+
+    def build_settings(self, parent):
+        c = self.card(parent, 'Settings', fill='x')
+        grid = tk.Frame(c, bg=PANEL)
+        grid.pack(fill='x', padx=14)
+        self.vars, self.entries = {}, []
+        for i, (k, label, hint) in enumerate(FIELDS):
+            lbl = tk.Label(grid, text=label + '  ⓘ', bg=PANEL, fg=TEXT, font=(self.ui, 10))
+            lbl.grid(row=i, column=0, sticky='w')
+            v = tk.StringVar(value=str(getattr(key, k, E.DEFAULTS[k])))
+            e = ttk.Entry(grid, textvariable=v, width=10, justify='right', font=(self.mono, 10))
+            e.grid(row=i, column=1, sticky='e', padx=(12, 0), pady=3)
+            Tooltip(lbl, hint, (self.ui, 9))
+            Tooltip(e, hint, (self.ui, 9))
+            self.vars[k] = v
+            self.entries.append(e)
+        grid.columnconfigure(0, weight=1)
+
+        tk.Frame(c, bg=BORDER, height=1).pack(fill='x', padx=14, pady=10)
+        self.dry_run = tk.BooleanVar(value=bool(getattr(key, 'dry_run', True)))
+        self.radios = [ttk.Radiobutton(c, text='Dry run  (paper trades only)', variable=self.dry_run, value=True,
+                                       command=self.mode_changed),
+                       ttk.Radiobutton(c, text='Live trading  (real orders)', variable=self.dry_run, value=False,
+                                       command=self.mode_changed)]
+        for r in self.radios:
+            r.pack(anchor='w', padx=14, pady=1)
+
+        btns = tk.Frame(c, bg=PANEL)
+        btns.pack(fill='x', padx=14, pady=(12, 4))
+        btns.columnconfigure(0, weight=1)
+        btns.columnconfigure(1, weight=1)
+        self.start_btn = ttk.Button(btns, text='▶  Start', style='Start.TButton', command=self.start)
+        self.start_btn.grid(row=0, column=0, sticky='ew', padx=(0, 4))
+        self.stop_btn = ttk.Button(btns, text='■  Stop', style='Stop.TButton', command=self.stop, state='disabled')
+        self.stop_btn.grid(row=0, column=1, sticky='ew', padx=(4, 0))
+        self.reset_btn = ttk.Button(c, text='Reset settings to defaults', style='Link.TButton', command=self.reset)
+        self.reset_btn.pack(anchor='w', padx=14, pady=(2, 12))
+        self.mode_changed()
+
+    def build_account(self, parent):
+        c = self.card(parent, 'Account', fill='x', pady=(12, 0))
+        self.acct_status = tk.Label(c, text='Not connected', bg=PANEL, fg=MUTED, font=(self.ui, 9),
+                                    wraplength=250, justify='left')
+        self.acct_status.pack(anchor='w', padx=14)
+        grid = tk.Frame(c, bg=PANEL)
+        grid.pack(fill='x', padx=14, pady=(8, 12))
+        grid.columnconfigure(1, weight=1)
+        self.bal = {}
+        for i, a in enumerate(E.ASSETS):
+            tk.Label(grid, text=a, bg=PANEL, fg=MUTED, font=(self.ui, 10)).grid(row=i, column=0, sticky='w')
+            v = tk.Label(grid, text='—', bg=PANEL, fg=TEXT, font=(self.mono, 10))
+            v.grid(row=i, column=1, sticky='e')
+            self.bal[a] = v
+
+    def table(self, parent, cols, height):
+        frame = tk.Frame(parent, bg=PANEL)
+        frame.pack(fill='both', expand=True, padx=1, pady=(0, 1))
+        t = ttk.Treeview(frame, columns=[c[0] for c in cols], show='headings', height=height, selectmode='none')
+        for cid, label, width, anchor in cols:
+            t.heading(cid, text=label, anchor=anchor)
+            t.column(cid, width=width, anchor=anchor, stretch=cid in ('route', 'pair'))
+        t.pack(fill='both', expand=True)
+        for tag, colour in (('go', GREEN), ('near', AMBER), ('far', TEXT), ('na', DIM), ('bad', RED),
+                            ('muted', MUTED)):
+            t.tag_configure(tag, foreground=colour)
+        return t
+
+    def build_routes(self, parent):
+        c = self.card(parent, 'Routes  ·  net profit after fees and spread, at current prices', fill='x')
+        self.routes = self.table(c, [('route', 'Route', 230, 'w'), ('net', 'Net', 90, 'e'),
+                                     ('fees', 'Fees', 80, 'e'), ('meter', 'Distance to trigger', 250, 'w'),
+                                     ('note', 'Note', 140, 'w')], 6)
+
+    def build_chart(self, parent):
+        c = self.card(parent, 'Best route over time', fill='x', pady=(12, 0))
+        self.chart = tk.Canvas(c, height=130, bg=PANEL, highlightthickness=0)
+        self.chart.pack(fill='x', padx=14, pady=(0, 12))
+        self.chart.bind('<Configure>', lambda e: self.draw_chart())
+
+    def build_bottom(self, parent):
+        nb = ttk.Notebook(parent)
+        nb.pack(fill='both', expand=True, pady=(12, 0))
+
+        prices = tk.Frame(nb, bg=PANEL)
+        self.prices = self.table(prices, [('pair', 'Pair', 120, 'w'), ('bid', 'Bid', 110, 'e'),
+                                          ('ask', 'Ask', 110, 'e'), ('spread', 'Spread', 90, 'e'),
+                                          ('depth', 'Top depth', 110, 'e'), ('fee', 'Your fee', 90, 'e')], 6)
+
+        log = tk.Frame(nb, bg=PANEL)
+        self.log_box = tk.Text(log, bg=PANEL, fg=TEXT, font=(self.mono, 9), relief='flat', wrap='word',
+                               padx=12, pady=8, height=8, state='disabled', insertbackground=TEXT,
+                               highlightthickness=0)
+        sb = ttk.Scrollbar(log, command=self.log_box.yview)
+        self.log_box.configure(yscrollcommand=sb.set)
+        sb.pack(side='right', fill='y')
+        self.log_box.pack(fill='both', expand=True)
+        for tag, colour in (('time', DIM), ('info', MUTED), ('warn', AMBER), ('error', RED), ('trade', GREEN)):
+            self.log_box.tag_configure(tag, foreground=colour)
+
+        trades = tk.Frame(nb, bg=PANEL)
+        self.trades = self.table(trades, [('time', 'Time', 80, 'w'), ('route', 'Route', 230, 'w'),
+                                          ('mode', 'Mode', 70, 'w'), ('planned', 'Planned', 90, 'e'),
+                                          ('outcome', 'Outcome', 120, 'w'), ('pnl', 'P&L', 110, 'e')], 6)
+
+        nb.add(log, text='Activity')
+        nb.add(prices, text='Prices')
+        nb.add(trades, text='Trades')
+        self.trades_tab, self.nb = trades, nb
+
+    # ------------------------------------------------------------------ actions
+    def mode_changed(self):
+        if self.dry_run.get():
+            self.set_pill(self.p_mode, 'DRY RUN', AMBER)
+        else:
+            self.set_pill(self.p_mode, '● LIVE', RED)
+
+    def reset(self):
+        for k, v in self.vars.items():
+            v.set(str(E.DEFAULTS[k]))
+        self.log('Settings reset to defaults.', 'info')
+
+    def read_settings(self):
+        s = {}
+        for k, label, _ in FIELDS:
+            try:
+                s[k] = float(self.vars[k].get())
+            except ValueError:
+                raise ValueError(f'"{label}" must be a number')
+            if s[k] < 0:
+                raise ValueError(f'"{label}" cannot be negative')
+        if s['size'] < 20:
+            raise ValueError('Trade size should be at least 20: Binance needs 5 per order and the '
+                             'stablecoin pair only trades whole units')
+        if s['interval'] < 0.5:
+            raise ValueError('Check every should be at least 0.5 s (Binance rate limits)')
+        if s['min_profit'] < 0.05:
+            raise ValueError('Min profit below 0.05% leaves no room for price movement between orders')
+        s['max_trades'] = int(s['max_trades'])
+        s['dry_run'] = self.dry_run.get()
+        return s
 
     def start(self):
         try:
-            settings = {'size': float(self.size.get()),
-                        'fee': float(self.fee.get()) / 100,
-                        'min_profit': float(self.min_profit.get()) / 100,
-                        'interval': float(self.interval.get()),
-                        'dry_run': self.dry_run.get()}
-        except ValueError:
-            messagebox.showerror('Settings', 'All settings must be numbers.')
+            s = self.read_settings()
+        except ValueError as e:
+            messagebox.showerror('Settings', str(e))
             return
-        if not settings['dry_run'] and not messagebox.askyesno(
-                'Live trading', 'Dry run is off. This will place REAL market orders. Continue?'):
+        if not s['dry_run'] and not messagebox.askyesno(
+                'Start live trading?',
+                'This places REAL orders on Binance with your API keys.\n\n'
+                f'• Up to {s["size"]:g} per trade, at most {s["max_trades"]} trades\n'
+                f'• Stops after a session loss of ${s["max_loss"]:g}\n'
+                '• Each trade is 3 orders; prices can move between them\n\n'
+                'Start live trading?', icon='warning'):
             return
-        self.stop_event.clear()
-        self.start_btn.configure(state='disabled')
-        self.stop_btn.configure(state='normal')
-        self.log('Started (%s)' % ('dry run' if settings['dry_run'] else 'LIVE'))
-        self.thread = threading.Thread(target=self.worker, args=(settings,), daemon=True)
-        self.thread.start()
+        self.min_profit = s['min_profit']
+        self.set_card('trigger', f'+{s["min_profit"]:.2f}%', 'worst-case net profit')
+        self.set_card('pnl', '$0.00', 'paper trading' if s['dry_run'] else 'live trading')
+        self.set_card('trades', '0', 'none yet')
+        self.history = []
+        self.stop_event = threading.Event()
+        engine = E.Engine(s, lambda k, d: self.events.put((k, d)), self.stop_event,
+                          api_key=getattr(key, 'api_key', None), api_secret=getattr(key, 'api_secret', None),
+                          market_data_url=getattr(key, 'market_data_url', None))
+        threading.Thread(target=engine.run, daemon=True).start()
+        self.running = True
+        self.set_running(True)
+        self.log(f'Started in {"DRY RUN" if s["dry_run"] else "LIVE"} mode: size {s["size"]:g}, '
+                 f'trigger at {s["min_profit"]:g}% worst-case profit, every {s["interval"]:g}s.', 'info')
 
     def stop(self):
-        self.stop_event.set()
+        if self.stop_event:
+            self.stop_event.set()
         self.stop_btn.configure(state='disabled')
+        self.set_pill(self.p_state, '… STOPPING', MUTED)
+
+    def set_running(self, on):
+        self.start_btn.configure(state='disabled' if on else 'normal')
+        self.stop_btn.configure(state='normal' if on else 'disabled')
+        for w in self.entries + self.radios + [self.reset_btn]:
+            w.configure(state='disabled' if on else 'normal')
+        self.set_pill(self.p_state, '● RUNNING' if on else '○ STOPPED', GREEN if on else MUTED)
 
     def close(self):
-        self.stop_event.set()
+        if self.stop_event:
+            self.stop_event.set()
         self.root.destroy()
 
-    def worker(self, settings):
-        #runs in a background thread; talks to the UI only through self.events
-        post = lambda kind, data: self.events.put((kind, data))
-        if self.arb is None:
-            try:
-                post('log', 'Connecting to Binance...')
-                self.arb = Arbitrage(Client(key.api_key, key.api_secret))
-                post('log', 'Watching: ' + ', '.join(self.arb.watch))
-            except Exception as e:
-                post('log', 'Could not connect: ' + str(e))
-                post('stopped', None)
-                return
+    def log(self, text, level='info'):
+        stamp = time.strftime('%H:%M:%S')
+        self.log_box.configure(state='normal')
+        self.log_box.insert('end', stamp + '  ', 'time')
+        self.log_box.insert('end', text + '\n', level)
+        if int(self.log_box.index('end-1c').split('.')[0]) > 2000:
+            self.log_box.delete('1.0', '500.0')
+        self.log_box.see('end')
+        self.log_box.configure(state='disabled')
+        self.logfile.write(f'{time.strftime("%Y-%m-%d")} {stamp} [{level}] {text}\n')
+        self.logfile.flush()
 
-        while not self.stop_event.is_set():
-            try:
-                books = self.arb.books()
-                routes = self.arb.routes(books, settings)
-                post('update', (books, routes))
-
-                usable = [r for r in routes if r['deep']]
-                best = max(usable, key=lambda r: r['profit']) if usable else None
-                if best and best['profit'] > settings['min_profit']:
-                    a, b = best['a'], best['b']
-                    route = '%s -> %s -> %s -> %s (%+.4f%%)' % (a, COIN, b, a, best['profit'] * 100)
-                    if settings['dry_run']:
-                        post('log', 'DRY RUN: would trade ' + route)
-                    elif self.arb.balance(a) < settings['size']:
-                        post('log', 'Opportunity %s, but not enough %s' % (route, a))
-                    else:
-                        post('log', 'Executing ' + route)
-                        for order in self.arb.execute(a, b, settings['size']):
-                            post('log', '%s %s qty=%s quote=%s' % (
-                                order['symbol'], order['side'], order['executedQty'],
-                                order['cummulativeQuoteQty']))
-            except Exception as e:
-                post('log', 'Error: ' + str(e))
-            self.stop_event.wait(settings['interval'])
-        post('stopped', None)
-
+    # ------------------------------------------------------------------ engine events
     def poll(self):
-        #apply worker results to the UI (Tkinter must only be touched from this thread)
-        while not self.events.empty():
-            kind, data = self.events.get()
-            if kind == 'log':
-                self.log(data)
-            elif kind == 'stopped':
-                self.log('Stopped')
-                self.start_btn.configure(state='normal')
-                self.stop_btn.configure(state='disabled')
-            elif kind == 'update':
-                books, routes = data
-                self.prices.delete(*self.prices.get_children())
-                for s, b in books.items():
-                    if b is None:
-                        self.prices.insert('', 'end', text=s, values=('empty', 'empty'))
-                    else:
-                        self.prices.insert('', 'end', text=s, values=(b['bid'], b['ask']))
-                self.routes.delete(*self.routes.get_children())
-                for r in sorted(routes, key=lambda r: -r['profit']):
-                    self.routes.insert('', 'end', text='%s -> %s -> %s -> %s' % (r['a'], COIN, r['b'], r['a']),
-                                       values=('%+.4f%%' % (r['profit'] * 100),
-                                               '' if r['deep'] else 'not enough depth'),
-                                       tags=('win' if r['profit'] > 0 else 'loss',))
-        self.root.after(200, self.poll)
+        try:
+            for _ in range(200):
+                kind, data = self.events.get_nowait()
+                getattr(self, 'on_' + kind)(data)
+        except queue.Empty:
+            pass
+        self.root.after(100, self.poll)
+
+    def on_log(self, data):
+        self.log(data[1], data[0])
+
+    def on_status(self, st):
+        host = 'data-api.binance.vision' if 'vision' in st['market'] else 'api.binance.com'
+        self.set_pill(self.p_data, host, BLUE)
+        self.acct_status.configure(text=f'Trading: {st["trading"]}', fg=GREEN if st['trading'] == 'ready' else AMBER)
+        self.set_fees_pill(st['fees'])
+
+    def set_fees_pill(self, source):
+        if source == 'account':
+            self.set_pill(self.p_fees, 'FEES: YOUR ACCOUNT', GREEN)
+        else:
+            self.set_pill(self.p_fees, f'FEES: FALLBACK {self.vars["fallback_fee"].get()}%', AMBER)
+
+    def on_fees(self, data):
+        self.fees = data['rates'] if data['source'] == 'account' else {}
+        self.set_fees_pill(data['source'])
+
+    def on_balances(self, bal):
+        for a, w in self.bal.items():
+            v = bal.get(a)
+            w.configure(text='—' if v is None else f'{v:,.4f}' if a in ('SOL', 'BNB') else f'{v:,.2f}')
+
+    def on_tick(self, t):
+        st = t['stats']
+        lat = t['latency']
+        self.set_pill(self.p_data, f'{time.strftime("%H:%M:%S")} · {lat:.0f} ms', GREEN if lat < 500 else AMBER)
+
+        # routes
+        self.routes.delete(*self.routes.get_children())
+        for r in sorted(t['routes'], key=lambda r: -(r['pct'] if r['pct'] is not None else -99)):
+            if r['pct'] is None:
+                self.routes.insert('', 'end', values=(r['name'], '—', f'{r["fees_pct"]:.3f}%', '', r['why'] or ''),
+                                   tags=('na',))
+                continue
+            gap = self.min_profit - r['pct']
+            tag = 'go' if gap <= 0 else 'near' if gap < 0.1 else 'far'
+            self.routes.insert('', 'end', values=(
+                r['name'], f'{r["pct"]:+.3f}%', f'{r["fees_pct"]:.3f}%', self.meter(r['pct']),
+                'thin top of book' if r['thin'] else ''), tags=(tag,))
+
+        # prices
+        self.prices.delete(*self.prices.get_children())
+        fees = self.fees
+        for s, b in t['books'].items():
+            if b is None:
+                self.prices.insert('', 'end', values=(s, 'no book', '', '', '', ''), tags=('bad',))
+                continue
+            (bid, bq), (ask, aq) = b['bids'][0], b['asks'][0]
+            spread = (ask - bid) / ask * 10000
+            depth = min(bid * bq, ask * aq)
+            fee = fees.get(s)
+            places = 2 if bid > 10 else 5
+            self.prices.insert('', 'end', values=(
+                s, f'{bid:.{places}f}', f'{ask:.{places}f}', f'{spread:.2f} bps', f'${depth:,.0f}',
+                f'{fee[0] * 100:.3f}%' if fee else f'{float(self.vars["fallback_fee"].get()):.3f}%'),
+                tags=('far',))
+
+        # cards
+        best = max((r for r in t['routes'] if r['pct'] is not None), key=lambda r: r['pct'], default=None)
+        if best:
+            gap = self.min_profit - best['pct']
+            self.set_card('best', f'{best["pct"]:+.3f}%', best['name'],
+                          GREEN if gap <= 0 else AMBER if gap < 0.1 else TEXT)
+            self.set_card('trigger', f'+{self.min_profit:.2f}%',
+                          'triggering now' if gap <= 0 else f'best route is {gap:.3f}% away')
+            self.history.append(best['pct'])
+            del self.history[:-HISTORY]
+            self.draw_chart()
+        cd = t['cooldown']
+        self.set_card('checks', f'{st["checks"]:,}',
+                      f'cooling down {math.ceil(cd)}s' if cd > 0.05 else f'{st["candidates"]} re-checked on depth')
+        dry = self.dry_run.get()
+        self.set_card('trades', str(st['trades']),
+                      f'{st["wins"]} profitable · {st["losses"]} losing' if st['trades'] else 'none yet')
+        pnl = st['pnl']
+        self.set_card('pnl', f'{"-" if pnl < 0 else ""}${abs(pnl):,.4f}',
+                      'paper trading' if dry else 'live trading',
+                      GREEN if pnl > 0 else RED if pnl < 0 else TEXT)
+
+    def meter(self, pct, low=-0.5):
+        """Text bar: empty at `low`% net, full at the trigger."""
+        frac = (pct - low) / (self.min_profit - low)
+        frac = max(0.0, min(1.0, frac))
+        n = round(frac * 10)
+        gap = self.min_profit - pct
+        return '▰' * n + '▱' * (10 - n) + ('   GO' if gap <= 0 else f'   {gap:.3f}% to go')
+
+    def on_trade(self, tr):
+        tag = 'go' if tr['pnl'] > 0 else 'bad' if tr['pnl'] < 0 else 'muted'
+        self.trades.insert('', 0, values=(tr['time'], tr['route'], 'LIVE' if tr['live'] else 'paper',
+                                          f'{tr["planned"]:+.3f}%', tr['outcome'],
+                                          f'{tr["pnl"]:+.4f} {tr["asset"]}'), tags=(tag,))
+        self.nb.select(self.trades_tab)
+        self.root.bell()
+
+    def on_halt(self, reason):
+        self.set_pill(self.p_state, '■ HALTED', RED)
+
+    def on_stopped(self, reason):
+        self.running = False
+        self.set_running(False)
+        if reason:
+            self.set_pill(self.p_state, '■ HALTED', RED)
+            if not self.dry_run.get():
+                messagebox.showwarning('Trading stopped', reason)
+        self.log('Stopped.', 'info')
+
+    # ------------------------------------------------------------------ chart
+    def draw_chart(self):
+        c = self.chart
+        c.delete('all')
+        w, h = max(c.winfo_width(), 200), int(c['height'])
+        left, right, top, bottom = 56, 10, 8, 20
+        data = self.history
+        lo = min([*data, -0.4, 0]) if data else -0.4
+        hi = max([*data, self.min_profit + 0.05]) if data else self.min_profit + 0.05
+        span = hi - lo or 1
+
+        def y(v):
+            return top + (hi - v) / span * (h - top - bottom)
+
+        for v, colour, label, dash in ((self.min_profit, GREEN, f'+{self.min_profit:.2f}% trigger', (4, 3)),
+                                       (0, DIM, '0%', (2, 4))):
+            c.create_line(left, y(v), w - right, y(v), fill=colour, dash=dash)
+            c.create_text(left - 6, y(v), text=label.split()[0], fill=colour, anchor='e', font=(self.mono, 8))
+        c.create_text(left - 6, y(lo), text=f'{lo:+.2f}%', fill=DIM, anchor='e', font=(self.mono, 8))
+        if hi > self.min_profit + 0.1:
+            c.create_text(left - 6, y(hi), text=f'{hi:+.2f}%', fill=DIM, anchor='e', font=(self.mono, 8))
+        c.create_text(w - right, h - 4, text='now', fill=DIM, anchor='se', font=(self.ui, 8))
+        c.create_text(left, h - 4, text=f'last {len(data)} checks', fill=DIM, anchor='sw', font=(self.ui, 8))
+        if len(data) < 2:
+            c.create_text((left + w - right) / 2, h / 2, text='Waiting for prices…', fill=DIM, font=(self.ui, 10))
+            return
+        step = (w - left - right) / (HISTORY - 1)
+        x0 = w - right - (len(data) - 1) * step
+        pts = []
+        for i, v in enumerate(data):
+            pts += [x0 + i * step, y(v)]
+        c.create_line(*pts, fill=PURPLE_HI, width=2, smooth=False)
+        c.create_oval(pts[-2] - 3, pts[-1] - 3, pts[-2] + 3, pts[-1] + 3, fill=PURPLE_HI, outline='')
 
 
 if __name__ == '__main__':
