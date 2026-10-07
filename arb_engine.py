@@ -16,6 +16,7 @@ Money safety rules:
 import json
 import threading
 import time
+import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal as D, ROUND_DOWN, ROUND_UP
@@ -123,9 +124,9 @@ class Fees:
         for s in SYMBOLS:
             c = client._get('account/commission', True, data={'symbol': s})
             for side, extra in (('BUY', 'buyer'), ('SELL', 'seller')):
-                rates[(s, side)] = sum((D(c[k]['taker']) + D(c[k][extra])
-                                        for k in ('standardCommission', 'taxCommission', 'specialCommission')
-                                        if k in c), ZERO)
+                std = c['standardCommission']     # required: a missing block must not read as 0%
+                rates[(s, side)] = D(std['taker']) + D(std[extra]) + sum(
+                    (D(c[k]['taker']) + D(c[k][extra]) for k in ('taxCommission', 'specialCommission') if k in c), ZERO)
         self.rates, self.source = rates, 'account'
 
     def route_total(self, a, b):
@@ -192,8 +193,9 @@ class Plan:
 def plan_route(a, b, budget, books, rules, fees, cushion=ZERO, dust_steps=12):
     """Plan one route against the given books. Returns (Plan, None) or (None, reason).
 
-    Profit is the worst case: every leg fills entirely at its limit price, with real fees,
-    lot rounding (whole units on the stable pair) and leftovers valued at the limit prices."""
+    `pct` is the worst case: every leg fills entirely at its limit price, with real fees and
+    lot rounding (whole units on the stable pair), counting only what comes back as A.
+    The few cents of SOL/B dust left over are a bonus on top (`pct_with_dust`)."""
     sa, sb = COIN + a, COIN + b
     stable, side3 = stable_leg(a, b)
     if any(s not in rules or s not in books or books[s] is None for s in (sa, sb, stable)):
@@ -235,7 +237,7 @@ def plan_route(a, b, budget, books, rules, fees, cushion=ZERO, dust_steps=12):
         filled3, _, worst3 = walk(books[stable]['asks'], est)
         p3 = rs.price('BUY', worst3) if worst3 else ZERO
         b_to_a = (ONE - f3) / p3 if p3 else ZERO
-    if not p3 or filled3 <= 0:
+    if not p3 or filled3 <= 0 or filled3 < (floor_to(b_max, rs.step) if side3 == 'SELL' else est):
         return None, f'{stable} book too thin'
 
     def legs_2_3(q2):
@@ -275,8 +277,8 @@ def plan_route(a, b, budget, books, rules, fees, cushion=ZERO, dust_steps=12):
     return Plan(a=a, b=b, sa=sa, sb=sb, stable=stable, side3=side3,
                 q1=q1, p1=p1, q2=q2, p2=p2, q3=q3, p3=p3,
                 spend=spend, a_back=a_back, dust_value=dust_value, profit=profit,
-                pct=profit / spend * HUNDRED, cash_profit=a_back - spend,
-                fees_pct=(f1 + f2 + f3) * HUNDRED), None
+                cash_profit=a_back - spend, pct=(a_back - spend) / spend * HUNDRED,
+                pct_with_dust=profit / spend * HUNDRED, fees_pct=(f1 + f2 + f3) * HUNDRED), None
 
 
 def books_from_tickers(tickers, deep=False):
@@ -315,8 +317,9 @@ class OrderUnknown(Exception):
 
 
 def place_limit(client, rules, side, qty, price, tif, tag):
-    """LIMIT IOC/FOK with a FULL response. Raises BinanceAPIException for a definite
-    rejection (nothing executed) and OrderUnknown if the outcome cannot be confirmed."""
+    """LIMIT IOC/FOK with a FULL response. Raises BinanceAPIException only for a definite
+    rejection (the order never reached the matching engine) and OrderUnknown if the
+    outcome cannot be confirmed."""
     coid = f'arb{tag}{uuid.uuid4().hex[:20]}'
     params = dict(symbol=rules.symbol, side=side, type='LIMIT', timeInForce=tif,
                   quantity=fmt(qty, rules.step), price=fmt(price, rules.tick),
@@ -326,46 +329,54 @@ def place_limit(client, rules, side, qty, price, tif, tag):
     except BinanceAPIException as e:
         if e.status_code < 500 and e.code not in UNKNOWN_CODES:
             raise
-    except (requests.exceptions.RequestException, BinanceRequestException):
+    except Exception:   # timeout, connection reset, bad JSON: the order may or may not exist
         pass
     return reconcile(client, rules.symbol, coid)
 
 
-def reconcile(client, symbol, coid, tries=4):
-    """Look up an order whose response was lost. Never resend blindly: that can double-buy."""
-    for i in range(tries):
-        time.sleep(0.25 * (i + 1))
+RECONCILE_TRIES, RECONCILE_DELAY = 5, 0.5
+
+
+def reconcile(client, symbol, coid):
+    """Look up an order whose response was lost. Never resend blindly: that can double-buy.
+    Only ever returns a Fill or raises OrderUnknown."""
+    for i in range(RECONCILE_TRIES):
+        time.sleep(RECONCILE_DELAY * (i + 1))
         try:
             o = client.get_order(symbol=symbol, origClientOrderId=coid)
-        except BinanceAPIException as e:
-            if e.code == -2013 or e.status_code >= 500 or e.code in UNKNOWN_CODES:
+            if o['status'] in ('NEW', 'PARTIALLY_FILLED', 'PENDING_NEW'):
                 continue
-            raise
-        except (requests.exceptions.RequestException, BinanceRequestException):
-            continue
-        if o['status'] in ('NEW', 'PARTIALLY_FILLED', 'PENDING_NEW'):
-            continue
-        trades = client.get_my_trades(symbol=symbol, orderId=o['orderId']) if D(o['executedQty']) > 0 else []
-        return Fill(o, trades)
-    raise OrderUnknown(f'{symbol} order {coid}: outcome unknown, check Binance')
+            executed = D(o['executedQty'])
+            trades = client.get_my_trades(symbol=symbol, orderId=o['orderId']) if executed > 0 else []
+            if sum((D(t['qty']) for t in trades), ZERO) != executed:
+                continue                       # not all trades visible yet
+            return Fill(o, trades)
+        except BinanceAPIException as e:
+            if e.status_code in (418, 429):
+                time.sleep(2)
+        except Exception:
+            pass
+    raise OrderUnknown(f'{symbol} order {coid}: outcome unknown, check your Binance order history')
 
 
 class Result:
     def __init__(self):
-        self.outcome, self.fills, self.notes = 'STARTED', [], []
+        self.outcome, self.fills, self.notes, self.code = 'STARTED', [], [], None
         self.a_spent = self.a_received = self.sol_left = self.b_left = self.pnl = ZERO
+        self.leg_rejected = False
 
 
 def execute(client, plan, rules, fees, fetch_book, leg2_wait=LEG2_WAIT):
-    """Run the three legs of a plan. Returns a Result; never raises for a rejected order."""
-    ra, rb, rs = rules[plan.sa], rules[plan.sb], rules[plan.stable]
-    res = Result()
+    """Run the three legs of a plan. Returns a Result and never raises.
 
-    # leg 1: all or nothing at <= p1
+    Outcomes: NO_FILL / REJECTED (leg 1 did nothing, no cost), DONE, LEG_REJECTED (a later
+    leg was refused; SOL sold back), HOLDING_SOL / HOLDING_<B> (something could not be
+    converted back), UNKNOWN (an order's outcome could not be confirmed)."""
+    res = Result()
     try:
-        f1 = place_limit(client, ra, 'BUY', plan.q1, plan.p1, 'FOK', '1')
+        f1 = place_limit(client, rules[plan.sa], 'BUY', plan.q1, plan.p1, 'FOK', '1')
     except BinanceAPIException as e:
-        res.outcome = 'REJECTED'
+        res.outcome, res.code = 'REJECTED', e.code
         res.notes.append(f'leg 1 rejected: {e.message} ({e.code})')
         return res
     except OrderUnknown as e:
@@ -377,142 +388,193 @@ def execute(client, plan, rules, fees, fetch_book, leg2_wait=LEG2_WAIT):
         res.outcome = 'NO_FILL'
         res.notes.append('leg 1 did not fill (price moved), nothing traded')
         return res
+    try:
+        finish(client, plan, rules, fees, fetch_book, leg2_wait, res, f1)
+    except OrderUnknown as e:
+        res.outcome = 'UNKNOWN'
+        res.notes.append(str(e))
+    except Exception as e:   # we own SOL now: anything unexpected must stop the engine
+        res.outcome = 'UNKNOWN'
+        res.notes.append(f'unexpected error during the trade: {e!r}')
+    return res
+
+
+def finish(client, plan, rules, fees, fetch_book, leg2_wait, res, f1):
+    """Legs 2 and 3 (and the unwind) after leg 1 bought SOL. Updates res as it goes."""
+    ra, rb, rs = rules[plan.sa], rules[plan.sb], rules[plan.stable]
+    f1r, f2r, f3r = fees.get(plan.sa, 'BUY'), fees.get(plan.sb, 'SELL'), fees.get(plan.stable, plan.side3)
     res.a_spent = f1.quote + f1.commission.get(plan.a, ZERO)
-    sol = f1.net_base(COIN)
-    bnb_fee_value = ZERO
-    if 'BNB' in f1.commission:
-        bnb_fee_value += f1.quote * fees.get(plan.sa, 'BUY')
-
-    f2r, f3r = fees.get(plan.sb, 'SELL'), fees.get(plan.stable, plan.side3)
+    bought = f1.net_base(COIN)
+    res.sol_left = bought
+    bnb_fee = f1.quote * f1r if 'BNB' in f1.commission else ZERO
     b_to_a = plan.p3 * (ONE - f3r) if plan.side3 == 'SELL' else (ONE - f3r) / plan.p3
-    breakeven = res.a_spent / (sol * (ONE - f2r) * b_to_a)
+    breakeven = (res.a_spent + bnb_fee) / (bought * (ONE - f2r) * b_to_a)
 
-    # leg 2: sell SOL, first at the planned price, then never below break-even
-    b_got, price = ZERO, plan.p2
+    # leg 2: sell SOL for B, first at the planned price, then never below break-even
+    price = plan.p2
     try:
         for attempt in range(3):
-            q = floor_to(sol, rb.step)
+            q = floor_to(res.sol_left, rb.step)
             if q < rb.min_qty or q * price < rb.min_notional:
                 break
             f2 = place_limit(client, rb, 'SELL', q, price, 'IOC', f'2{attempt}')
             res.fills.append(f2)
-            sol -= f2.qty
-            b_got += f2.net_quote(plan.b)
+            res.sol_left -= f2.qty
+            res.b_left += f2.net_quote(plan.b)
             if 'BNB' in f2.commission:
-                bnb_fee_value += f2.quote * f2r * b_to_a
-            if floor_to(sol, rb.step) < rb.min_qty:
+                bnb_fee += f2.quote * f2r * b_to_a
+            if floor_to(res.sol_left, rb.step) < rb.min_qty:
                 break
+            res.notes.append(f'leg 2 filled {f2.qty} of {q} SOL')
             price, deadline = None, time.monotonic() + leg2_wait
             floor_price = rb.price('SELL', breakeven)
             while price is None and time.monotonic() < deadline:
-                bids = fetch_book(plan.sb)['bids']
+                try:
+                    bids = fetch_book(plan.sb)['bids']
+                except Exception:
+                    bids = []
                 if bids and bids[0][0] >= floor_price:
-                    price = max(walk(bids, floor_to(sol, rb.step))[2], floor_price)
+                    price = max(walk(bids, floor_to(res.sol_left, rb.step))[2], floor_price)
                 else:
                     time.sleep(0.2)
-            res.notes.append(f'leg 2 partly filled, {sol} SOL left')
             if price is None:
                 break
     except BinanceAPIException as e:
+        res.leg_rejected = True
         res.notes.append(f'leg 2 rejected: {e.message} ({e.code})')
-    except OrderUnknown as e:
-        res.outcome = 'UNKNOWN'
-        res.notes.append(str(e))
-        return res
+        if e.status_code in (418, 429):
+            time.sleep(1)
 
-    # leftover SOL: sell back on SOL/A with a capped loss, otherwise hold it and stop
-    q_left = floor_to(sol, ra.step)
-    if q_left >= ra.min_qty:
-        floor_px = ra.price('SELL', res.a_spent / f1.net_base(COIN) * (ONE - UNWIND_MAX_LOSS))
+    # leftover SOL: sell it back on SOL/A, at most UNWIND_MAX_LOSS below what it cost
+    q_left = floor_to(res.sol_left, ra.step)
+    floor_px = ra.price('SELL', res.a_spent / bought * (ONE - UNWIND_MAX_LOSS))
+    if q_left >= ra.min_qty and q_left * floor_px >= ra.min_notional:
         try:
-            if q_left * floor_px >= ra.min_notional:
-                fu = place_limit(client, ra, 'SELL', q_left, floor_px, 'IOC', 'u')
-                res.fills.append(fu)
-                sol -= fu.qty
-                res.a_received += fu.net_quote(plan.a)
-                res.notes.append(f'sold {fu.qty} leftover SOL back on {plan.sa}')
-        except (BinanceAPIException, OrderUnknown) as e:
-            res.notes.append(f'unwind failed: {e}')
-    res.sol_left = sol
+            fu = place_limit(client, ra, 'SELL', q_left, floor_px, 'IOC', 'u')
+            res.fills.append(fu)
+            res.sol_left -= fu.qty
+            res.a_received += fu.net_quote(plan.a)
+            if 'BNB' in fu.commission:
+                bnb_fee += fu.quote * fees.get(plan.sa, 'SELL')
+            res.notes.append(f'sold {fu.qty} leftover SOL back on {plan.sa}')
+        except BinanceAPIException as e:
+            res.leg_rejected = True
+            res.notes.append(f'selling leftover SOL rejected: {e.message} ({e.code})')
 
-    # leg 3: B back to A at the planned price (whole units); a small remainder stays as B
-    b = b_got
+    # leg 3: B back to A at the planned price, in whole units
     try:
         for attempt in range(2):
+            b = res.b_left
             q3 = floor_to(b, rs.step) if plan.side3 == 'SELL' else floor_to(b / plan.p3, rs.step)
             if q3 < rs.min_qty or q3 * plan.p3 < rs.min_notional:
                 break
             f3 = place_limit(client, rs, plan.side3, q3, plan.p3, 'IOC', f'3{attempt}')
             res.fills.append(f3)
             if plan.side3 == 'SELL':
-                b -= f3.qty
+                res.b_left -= f3.qty
                 res.a_received += f3.net_quote(plan.a)
             else:
-                b -= f3.quote
+                res.b_left -= f3.quote
                 res.a_received += f3.net_base(plan.a)
             if 'BNB' in f3.commission:
-                bnb_fee_value += (f3.quote if plan.side3 == 'SELL' else f3.qty) * f3r
+                bnb_fee += (f3.quote if plan.side3 == 'SELL' else f3.qty) * f3r
             if f3.status == 'FILLED':
                 break
             time.sleep(0.3)
     except BinanceAPIException as e:
+        res.leg_rejected = True
         res.notes.append(f'leg 3 rejected: {e.message} ({e.code})')
-    except OrderUnknown as e:
-        res.outcome = 'UNKNOWN'
-        res.notes.append(str(e))
-    res.b_left = b
 
-    # P&L in A: what came back, plus leftovers at their planned value, minus what was spent
-    leftovers = res.sol_left * plan.p2 * (ONE - f2r) * b_to_a + res.b_left * b_to_a
-    res.pnl = res.a_received + leftovers - res.a_spent - bnb_fee_value
-    if res.outcome != 'UNKNOWN':
-        if floor_to(res.sol_left, ra.step) >= ra.min_qty:
-            res.outcome = 'HOLDING_SOL'
-        elif res.b_left * b_to_a > ONE:
-            res.outcome = 'HOLDING_' + plan.b
-        else:
-            res.outcome = 'DONE'
-    return res
+    # P&L in A: what came back, plus leftovers at today's prices, minus what was spent
+    sol_px, b_px = current_values(plan, fees, fetch_book, res)
+    res.pnl = res.a_received + res.sol_left * sol_px + res.b_left * b_px - res.a_spent - bnb_fee
+    sellable = floor_to(res.sol_left, ra.step)
+    if sellable >= ra.min_qty and sellable * plan.p1 >= ra.min_notional:
+        res.outcome = 'HOLDING_SOL'
+    elif res.b_left * b_px > ONE:
+        res.outcome = 'HOLDING_' + plan.b
+    elif res.leg_rejected:
+        res.outcome = 'LEG_REJECTED'
+    else:
+        res.outcome = 'DONE'
+
+
+def current_values(plan, fees, fetch_book, res):
+    """What one leftover SOL and one leftover B are worth in A right now (after fees).
+    If the books cannot be read, assume 10% / 2% haircuts on the planned prices."""
+    f3r = fees.get(plan.stable, plan.side3)
+    sol_px = plan.p1 * D('0.9')
+    b_px = (plan.p3 * (ONE - f3r) if plan.side3 == 'SELL' else (ONE - f3r) / plan.p3) * D('0.98')
+    try:
+        if res.sol_left > 0:
+            bids = fetch_book(plan.sa)['bids']
+            sol_px = bids[0][0] * (ONE - fees.get(plan.sa, 'SELL')) if bids else ZERO
+        if res.b_left > 0:
+            bk = fetch_book(plan.stable)
+            if plan.side3 == 'SELL':
+                b_px = bk['bids'][0][0] * (ONE - f3r) if bk['bids'] else ZERO
+            else:
+                b_px = (ONE - f3r) / bk['asks'][0][0] if bk['asks'] else ZERO
+    except Exception:
+        pass
+    return sol_px, b_px
 
 
 def paper_fill(plan, books, rules, fees):
-    """Dry run: what the planned limit orders would have done against `books` (fetched
-    after the plan, so they include one round trip of price movement)."""
-    rb, rs = rules[plan.sb], rules[plan.stable]
-    if depth_at(books[plan.sa]['asks'], plan.p1, 'BUY') < plan.q1:
+    """Dry run: what the planned orders would have done against `books`, which were fetched
+    after the plan (so they include one round trip of price movement). Mirrors execute()."""
+    ra, rs = rules[plan.sa], rules[plan.stable]
+    f1r, f2r, f3r = fees.get(plan.sa, 'BUY'), fees.get(plan.sb, 'SELL'), fees.get(plan.stable, plan.side3)
+    asks = [(p, q) for p, q in books[plan.sa]['asks'] if p <= plan.p1]
+    got, cost, _ = walk(asks, plan.q1)
+    if got < plan.q1:
         return 'NO_FILL', ZERO
-    f2r, f3r = fees.get(plan.sb, 'SELL'), fees.get(plan.stable, plan.side3)
-    b_to_a = plan.p3 * (ONE - f3r) if plan.side3 == 'SELL' else (ONE - f3r) / plan.p3
-    good_bids = [(p, q) for p, q in books[plan.sb]['bids'] if p >= plan.p2]
-    sold, value, _ = walk(good_bids, plan.q2)
-    b = value * (ONE - f2r)
-    sol_left = plan.q1 * (ONE - fees.get(plan.sa, 'BUY')) - sold
+    bought = plan.q1 * (ONE - f1r)
+    sold, value, _ = walk([(p, q) for p, q in books[plan.sb]['bids'] if p >= plan.p2], plan.q2)
+    sol, b, a_back = bought - sold, value * (ONE - f2r), ZERO
+    if floor_to(sol, ra.step) >= ra.min_qty:      # sell the rest back, as execute() does
+        floor_px = ra.price('SELL', cost / bought * (ONE - UNWIND_MAX_LOSS))
+        u, u_value, _ = walk([(p, q) for p, q in books[plan.sa]['bids'] if p >= floor_px], floor_to(sol, ra.step))
+        sol -= u
+        a_back += u_value * (ONE - fees.get(plan.sa, 'SELL'))
     if plan.side3 == 'SELL':
-        good = [(p, q) for p, q in books[plan.stable]['bids'] if p >= plan.p3]
-        conv, got, _ = walk(good, floor_to(b, rs.step))
-        a_back, b_left = got * (ONE - f3r), b - conv
+        conv, got3, _ = walk([(p, q) for p, q in books[plan.stable]['bids'] if p >= plan.p3], floor_to(b, rs.step))
+        a_back, b = a_back + got3 * (ONE - f3r), b - conv
+        b_px = books[plan.stable]['bids'][0][0] * (ONE - f3r) if books[plan.stable]['bids'] else ZERO
     else:
-        good = [(p, q) for p, q in books[plan.stable]['asks'] if p <= plan.p3]
-        conv, cost, _ = walk(good, floor_to(b / plan.p3, rs.step))
-        a_back, b_left = conv * (ONE - f3r), b - cost
-    # unsold SOL would be sold back on SOL/A at up to UNWIND_MAX_LOSS below cost
-    unwind = sol_left * plan.p1 * (ONE - UNWIND_MAX_LOSS) * (ONE - fees.get(plan.sa, 'SELL')) if sol_left > rb.step else ZERO
-    pnl = a_back + b_left * b_to_a + unwind - plan.spend
-    return ('DONE' if sol_left <= rb.step else 'PARTIAL'), pnl
+        conv, cost3, _ = walk([(p, q) for p, q in books[plan.stable]['asks'] if p <= plan.p3], floor_to(b / plan.p3, rs.step))
+        a_back, b = a_back + conv * (ONE - f3r), b - cost3
+        b_px = (ONE - f3r) / books[plan.stable]['asks'][0][0] if books[plan.stable]['asks'] else ZERO
+    bids_a = books[plan.sa]['bids']
+    sol_px = bids_a[0][0] * (ONE - fees.get(plan.sa, 'SELL')) if bids_a else ZERO
+    pnl = a_back + sol * sol_px + b * b_px - cost
+    if floor_to(sol, ra.step) >= ra.min_qty and floor_to(sol, ra.step) * plan.p1 >= ra.min_notional:
+        return 'HOLDING_SOL', pnl
+    if b * b_px > ONE:
+        return 'HOLDING_' + plan.b, pnl
+    return 'DONE', pnl
 
 
 # ----------------------------------------------------------------------------- engine
+class _Client(Client):
+    def ping(self):   # older python-binance pings api.binance.com in the constructor
+        return {}
+
+
 def make_client(api_key=None, api_secret=None, timeout=10):
     try:
-        c = Client(api_key, api_secret, requests_params={'timeout': timeout}, ping=False)
+        c = _Client(api_key, api_secret, requests_params={'timeout': timeout}, ping=False)
     except TypeError:   # older python-binance without the ping argument
-        c = Client(api_key, api_secret, requests_params={'timeout': timeout})
+        c = _Client(api_key, api_secret, requests_params={'timeout': timeout})
     c.REQUEST_RECVWINDOW = 5000
     return c
 
 
 def has_keys(api_key, api_secret):
     return bool(api_key and api_secret and ' ' not in api_key and len(api_key) >= 20)
+
+
+HALT_OUTCOMES = ('UNKNOWN', 'LEG_REJECTED')   # plus every HOLDING_*
 
 
 class Engine:
@@ -528,6 +590,7 @@ class Engine:
         self.client_factory = client_factory
         self.sleep = sleep or stop_event.wait
         self.pub = self.trd = None
+        self.local = threading.local()      # one client per thread: Client is not thread safe
         self.rules, self.fees = {}, Fees(D(str(settings['fallback_fee'])) / HUNDRED)
         self.balances = {}
         self.pool = ThreadPoolExecutor(max_workers=3)
@@ -535,7 +598,8 @@ class Engine:
                       'pnl': ZERO, 'best_pct': None}
         self.cooldown_until = 0.0
         self.skip_until = {}   # route -> time; a route that failed its re-check rests for 5 s
-        self.last = {'fees': 0.0, 'balances': 0.0, 'clock': 0.0}
+        now = time.monotonic()
+        self.last = {'fees': now, 'balances': now, 'clock': now, 'rules': now}
         self.halted = None
 
     # ---- helpers
@@ -543,13 +607,17 @@ class Engine:
         self.emit('log', (level, text))
 
     def halt(self, reason):
-        self.halted = reason
-        self.log('Stopped: ' + reason, 'error')
-        self.emit('halt', reason)
+        if not self.halted:
+            self.halted = reason
+            self.log('Stopped: ' + reason, 'error')
+            self.emit('halt', reason)
         self.stop_event.set()
 
     def live(self):
         return not self.s['dry_run'] and self.trd is not None
+
+    def stats_out(self):
+        return dict(self.stats, pnl=float(self.stats['pnl']))
 
     # ---- setup
     def connect(self):
@@ -558,38 +626,44 @@ class Engine:
             self.pub.API_URL = self.market_data_url
         else:
             try:
-                self.pub._get('ping')
+                self.pub._get('ping', version='v3')
             except Exception:
                 self.pub.API_URL = DATA_API
                 self.log('api.binance.com is not reachable for market data, using data-api.binance.vision')
-        info = self.pub._get('exchangeInfo', data={'symbols': json.dumps(SYMBOLS, separators=(',', ':'))})
-        self.rules = {s['symbol']: Rules(s) for s in info['symbols']}
-        for s, r in self.rules.items():
-            if r.status != 'TRADING':
-                self.log(f'{s} is {r.status}, routes using it are skipped', 'warn')
+        self.local.client = self.pub
+        self.load_rules()
 
         status = {'market': self.pub.API_URL, 'keys': False, 'trading': 'dry run only (no API keys)'}
         if has_keys(self.api_key, self.api_secret):
-            self.trd = self.client_factory(self.api_key, self.api_secret, timeout=10)
             try:
+                self.trd = self.client_factory(self.api_key, self.api_secret, timeout=10)
                 self.sync_clock()
-                self.refresh_fees()
                 self.refresh_balances()
+                self.refresh_fees()
                 status.update(keys=True, trading='ready')
             except BinanceAPIException as e:
                 self.trd = None
                 status['trading'] = f'unavailable: {e.message}'
                 self.log(f'API keys could not be used ({e.status_code} {e.message}). Dry run only.', 'error')
-            except requests.exceptions.RequestException as e:
+            except Exception as e:
                 self.trd = None
-                status['trading'] = 'unavailable: network error'
-                self.log(f'Could not reach Binance with your keys: {e}. Dry run only.', 'error')
+                status['trading'] = 'unavailable: could not reach Binance'
+                self.log(f'Could not reach Binance with your keys ({e!r}). Dry run only.', 'error')
         else:
             self.log('No API keys in key.py: running on public market data, dry run only', 'warn')
         status['fees'] = self.fees.source
         self.emit('status', status)
         if not self.s['dry_run'] and self.trd is None:
             self.halt('live trading needs working API keys')
+
+    def load_rules(self):
+        info = self.pub._get('exchangeInfo', version='v3', data={'symbols': json.dumps(SYMBOLS, separators=(',', ':'))})
+        rules = {s['symbol']: Rules(s) for s in info['symbols']}
+        for s, r in rules.items():
+            if r.status != 'TRADING' and (s not in self.rules or self.rules[s].status == 'TRADING'):
+                self.log(f'{s} is {r.status}, routes using it are skipped', 'warn')
+        self.rules = rules
+        self.last['rules'] = time.monotonic()
 
     def sync_clock(self):
         best = None
@@ -608,9 +682,14 @@ class Engine:
             self.log('Loaded your real fees: ' + ', '.join(
                 f'{s} {self.fees.get(s, "BUY") * 100:.3f}%' for s in SYMBOLS))
         except Exception as e:
-            self.fees.source = 'fallback'
-            self.log(f'Could not read your fees ({e}); using {self.fees.fallback * 100}% per leg', 'warn')
-        self.last['fees'] = time.monotonic()
+            if self.fees.rates:
+                self.log(f'Could not re-read your fees ({e}); keeping the last ones read', 'warn')
+            else:
+                self.log(f'Could not read your fees ({e}); using {self.fees.fallback * 100}% per leg. '
+                         'Live trades wait until real fees are read.', 'warn')
+            self.last['fees'] = time.monotonic() - FEE_REFRESH + 30    # retry in 30 s
+        else:
+            self.last['fees'] = time.monotonic()
         self.emit('fees', {'source': self.fees.source,
                            'rates': {s: (self.fees.get(s, 'BUY'), self.fees.get(s, 'SELL')) for s in SYMBOLS}})
 
@@ -620,12 +699,34 @@ class Engine:
         self.last['balances'] = time.monotonic()
         self.emit('balances', dict(self.balances))
 
+    def housekeeping(self):
+        """Periodic re-reads. A failure is logged and retried later; market scanning goes on."""
+        now = time.monotonic()
+        jobs = [('rules', 600, self.load_rules)]
+        if self.trd is not None:
+            jobs += [('clock', CLOCK_REFRESH, self.sync_clock), ('fees', FEE_REFRESH, self.refresh_fees),
+                     ('balances', BALANCE_REFRESH, self.refresh_balances)]
+        for name, every, job in jobs:
+            if now - self.last[name] > every:
+                try:
+                    job()
+                except Exception as e:
+                    self.last[name] = now - every + 30
+                    self.log(f'Could not refresh {name}: {getattr(e, "message", e)}', 'warn')
+                    if getattr(e, 'code', None) == -1021 and name != 'clock':
+                        self.last['clock'] = 0
+
     # ---- market data
     def tickers(self):
-        return self.pub._get('ticker/bookTicker', data={'symbols': json.dumps(SYMBOLS, separators=(',', ':'))})
+        return self.pub._get('ticker/bookTicker', version='v3',
+                             data={'symbols': json.dumps(SYMBOLS, separators=(',', ':'))})
 
     def depth(self, symbol):
-        b = self.pub.get_order_book(symbol=symbol, limit=BOOK_LIMIT)
+        c = getattr(self.local, 'client', None)
+        if c is None:
+            c = self.local.client = self.client_factory(timeout=5)
+            c.API_URL = self.pub.API_URL
+        b = c.get_order_book(symbol=symbol, limit=BOOK_LIMIT)
         return {'bids': levels(b['bids']), 'asks': levels(b['asks'])}
 
     def depths(self, symbols):
@@ -635,38 +736,40 @@ class Engine:
     def run(self):
         try:
             self.connect()
+        except Exception as e:
+            self.log(f'Could not start: {getattr(e, "message", None) or e!r}', 'error')
+            self.halted = self.halted or 'could not connect to Binance'
+            self.stop_event.set()
+        try:
             while not self.stop_event.is_set():
                 started = time.monotonic()
                 try:
                     self.step()
                 except BinanceAPIException as e:
                     if e.status_code in (418, 429):
-                        wait = int(e.response.headers.get('Retry-After', 60)) if e.response is not None else 60
+                        wait = 60
+                        try:
+                            wait = int(e.response.headers.get('Retry-After', 60))
+                        except Exception:
+                            pass
                         self.log(f'Binance rate limit hit, pausing {wait}s', 'error')
                         self.sleep(wait)
                     elif e.code in FATAL_CODES or e.status_code == 451:
                         self.halt(f'Binance refused the request: {e.message}')
                     else:
                         self.log(f'Binance error: {e.message} ({e.code})', 'error')
-                except requests.exceptions.RequestException as e:
-                    self.log(f'Network error: {e.__class__.__name__}', 'error')
+                except (requests.exceptions.RequestException, BinanceRequestException) as e:
+                    self.log(f'Network error: {e.__class__.__name__}, retrying', 'error')
                 self.sleep(max(0.0, self.s['interval'] - (time.monotonic() - started)))
         except Exception as e:
-            self.log(f'Could not start: {e}', 'error')
+            self.log(traceback.format_exc(), 'error')
+            self.halt(f'unexpected error: {e!r}')
         finally:
             self.pool.shutdown(wait=False)
             self.emit('stopped', self.halted)
 
     def step(self):
-        now = time.monotonic()
-        if self.trd is not None:
-            if now - self.last['clock'] > CLOCK_REFRESH:
-                self.sync_clock()
-            if now - self.last['fees'] > FEE_REFRESH:
-                self.refresh_fees()
-            if now - self.last['balances'] > BALANCE_REFRESH:
-                self.refresh_balances()
-
+        self.housekeeping()
         t0 = time.monotonic()
         rows = self.tickers()
         latency = (time.monotonic() - t0) * 1000
@@ -686,11 +789,12 @@ class Engine:
         valid = [r for r in routes if r['pct'] is not None]
         best = max(valid, key=lambda r: r['pct']) if valid else None
         self.stats['best_pct'] = best['pct'] if best else None
-        stats = dict(self.stats, pnl=float(self.stats['pnl']))
         self.emit('tick', {'books': {s: top.get(s) for s in SYMBOLS}, 'routes': routes, 'latency': latency,
-                           'stats': stats, 'cooldown': max(0.0, self.cooldown_until - time.monotonic())})
+                           'stats': self.stats_out(), 'cooldown': max(0.0, self.cooldown_until - time.monotonic())})
 
         if self.halted or time.monotonic() < self.cooldown_until:
+            return
+        if self.stats['trades'] >= int(self.s['max_trades']):
             return
         for r in sorted(valid, key=lambda r: -r['pct']):
             if r['pct'] < float(min_profit):
@@ -707,47 +811,73 @@ class Engine:
         stable, _ = stable_leg(a, b)
         books = self.depths([COIN + a, COIN + b, stable])
         plan, why = plan_route(a, b, size, books, self.rules, self.fees, cushion=DEPTH_CUSHION)
-        if plan is None or plan.pct < min_profit or plan.cash_profit < 0:
+        if plan is None or plan.pct < min_profit:
             self.log(f'{route_name(a, b)} looked good but failed the depth re-check: '
                      + (why or f'{plan.pct:+.3f}% worst case'), 'info')
             return False
 
-        if self.live():
-            if self.balances.get(a, ZERO) < plan.spend:
-                self.log(f'{plan.name} {plan.pct:+.3f}%: not enough {a} (need {plan.spend:.2f})', 'warn')
-                return False
-            self.log(f'Trading {plan.name}, planned {plan.pct:+.3f}% ({plan.profit:+.4f} {a})', 'trade')
-            res = execute(self.trd, plan, self.rules, self.fees, self.depth)
-            for n in res.notes:
-                self.log(n, 'warn')
-            self.record(plan, res.outcome, res.pnl, live=True, fills=len(res.fills))
-            try:
-                self.refresh_balances()
-            except Exception:
-                pass
-            if res.outcome == 'UNKNOWN':
-                self.halt('an order outcome is unknown, check your Binance order history')
-            elif res.outcome == 'HOLDING_SOL':
-                self.halt(f'holding {res.sol_left} SOL that could not be sold safely')
-        else:
+        if not self.live():
             after = self.depths([COIN + a, COIN + b, stable])
             outcome, pnl = paper_fill(plan, after, self.rules, self.fees)
             self.log(f'DRY RUN {plan.name}: planned {plan.pct:+.3f}%, '
                      f'paper fill {outcome} {pnl:+.4f} {a}', 'trade')
             self.record(plan, outcome, pnl, live=False, fills=0)
+            return True
+
+        if self.fees.source != 'account':
+            self.log(f'{plan.name} {plan.pct:+.3f}%: not trading until your real fees are read', 'warn')
+            return False
+        if time.monotonic() - self.last['balances'] > 3 * BALANCE_REFRESH:
+            self.log(f'{plan.name} {plan.pct:+.3f}%: balances are out of date, not trading', 'warn')
+            return False
+        if self.balances.get(a, ZERO) < plan.spend:
+            self.log(f'{plan.name} {plan.pct:+.3f}%: not enough {a} (need {plan.spend:.2f})', 'warn')
+            return False
+
+        self.log(f'Trading {plan.name}, planned {plan.pct:+.3f}% ({plan.cash_profit:+.4f} {a})', 'trade')
+        try:
+            res = execute(self.trd, plan, self.rules, self.fees, self.depth)
+        except Exception as e:      # execute() should never raise; stop if it somehow does
+            self.record(plan, 'UNKNOWN', ZERO, live=True, fills=0)
+            self.halt(f'error during a live trade ({e!r}), check your Binance balances')
+            return True
+        for n in res.notes:
+            self.log(n, 'warn')
+        self.record(plan, res.outcome, res.pnl, live=True, fills=len(res.fills))
+        try:
+            self.refresh_balances()
+        except Exception:
+            self.last['balances'] = 0
+        if res.outcome in HALT_OUTCOMES or res.outcome.startswith('HOLDING_'):
+            left = []
+            if res.sol_left >= rules_min(self.rules, plan.sa):
+                left.append(f'{res.sol_left:.4f} SOL')
+            if res.b_left > ONE:
+                left.append(f'{res.b_left:.2f} {plan.b}')
+            self.halt(f'trade ended {res.outcome}' + (f', holding {" and ".join(left)}' if left else '')
+                      + '; check your Binance balances and orders')
+        elif res.outcome == 'REJECTED' and res.code in FATAL_CODES:
+            self.halt(f'Binance refused the order: {res.notes[-1]} (check the key has Spot trading enabled)')
         return True
 
     def record(self, plan, outcome, pnl, live, fills):
         traded = outcome not in ('NO_FILL', 'REJECTED')
         if traded:
             self.stats['trades'] += 1
-            self.stats['pnl'] += pnl
-            self.stats['wins' if pnl >= 0 else 'losses'] += 1
+            if outcome != 'UNKNOWN':
+                self.stats['pnl'] += pnl
+                self.stats['wins' if pnl >= 0 else 'losses'] += 1
         self.cooldown_until = time.monotonic() + (self.s['cooldown'] if traded else 10)
         self.emit('trade', {'time': time.strftime('%H:%M:%S'), 'route': plan.name, 'live': live,
-                            'planned': float(plan.pct), 'outcome': outcome, 'pnl': float(pnl),
-                            'asset': plan.a, 'size': float(plan.spend), 'fills': fills})
+                            'planned': float(plan.pct), 'outcome': outcome,
+                            'pnl': None if outcome == 'UNKNOWN' else float(pnl),
+                            'asset': plan.a, 'size': float(plan.spend), 'fills': fills,
+                            'stats': self.stats_out()})
         if self.stats['pnl'] <= -D(str(self.s['max_loss'])):
             self.halt(f'session loss limit reached ({self.stats["pnl"]:.2f})')
         elif self.stats['trades'] >= int(self.s['max_trades']):
-            self.halt(f'reached {self.s["max_trades"]} trades this session')
+            self.halt(f'reached {int(self.s["max_trades"])} trades this session')
+
+
+def rules_min(rules, symbol):
+    return rules[symbol].min_qty if symbol in rules else D('0.001')

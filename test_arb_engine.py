@@ -16,6 +16,8 @@ from binance.exceptions import BinanceAPIException
 
 import arb_engine as E
 
+E.RECONCILE_DELAY = 0.01   # keep the order look-up retries fast in tests
+
 
 def sym_info(symbol, base, quote, tick, step, status='TRADING'):
     return {'symbol': symbol, 'status': status, 'baseAsset': base, 'quoteAsset': quote, 'filters': [
@@ -57,6 +59,8 @@ def make_books(sol_bids, depth='50'):
 FAIR = make_books({'USDT': '118.80', 'FDUSD': '118.92', 'USDC': '118.80'})
 # SOL is ~1% dearer in FDUSD: buy with USDT/USDC, sell for FDUSD
 MISPRICED = make_books({'USDT': '118.80', 'FDUSD': '120.00', 'USDC': '118.80'})
+# SOL is ~1% dearer in USDT: FDUSD > SOL > USDT > FDUSD buys FDUSD back on FDUSDUSDT (BUY side)
+MISPRICED_USDT = make_books({'USDT': '120.20', 'FDUSD': '118.92', 'USDC': '118.80'})
 
 
 def as_levels(books):
@@ -86,12 +90,20 @@ class FakeExchange:
         self.info = {s['symbol']: s for s in EXCHANGE_INFO}
         self.orders, self.by_coid, self.next_id = [], {}, 1
         self.fail_next = None      # (exception, executed_anyway) for the next create_order
+        self.reject = {}           # symbol -> exception raised (definitely) by every order on it
+        self.faults = {}           # method name -> list of exceptions raised by its next calls
         self.before_order = None   # callback(params) run before matching, e.g. to move the market
+        self.commission_error = None
         self.API_URL, self.timestamp_offset, self.lock = 'fake', 0, threading.Lock()
 
     # public market data
+    def fault(self, name):
+        if self.faults.get(name):
+            raise self.faults[name].pop(0)
+
     def _get(self, path, signed=False, version=None, **kw):
         data = kw.get('data', {})
+        assert signed or version == 'v3', 'public calls must ask for /api/v3 (old python-binance defaults to v1)'
         if path == 'ping':
             return {}
         if path == 'exchangeInfo':
@@ -99,6 +111,8 @@ class FakeExchange:
         if path == 'ticker/bookTicker':
             return [self.ticker(s) for s in json.loads(data['symbols'])]
         if path == 'account/commission':
+            if self.commission_error:
+                raise self.commission_error
             f, z = str(self.fee), '0'
             return {'symbol': data['symbol'], 'standardCommission': {'maker': z, 'taker': f, 'buyer': z, 'seller': z},
                     'taxCommission': {'maker': z, 'taker': z, 'buyer': z, 'seller': z}}
@@ -111,6 +125,7 @@ class FakeExchange:
         return {'symbol': s, 'bidPrice': str(bid[0]), 'bidQty': str(bid[1]), 'askPrice': str(ask[0]), 'askQty': str(ask[1])}
 
     def get_order_book(self, symbol, limit=100):
+        self.fault('get_order_book')
         with self.lock:
             b = self.books[symbol]
             return {k: [[str(p), str(q)] for p, q in b[k][:limit]] for k in ('bids', 'asks')}
@@ -126,6 +141,8 @@ class FakeExchange:
         self.orders.append(p)
         if self.before_order:
             self.before_order(p)
+        if p['symbol'] in self.reject:
+            raise self.reject[p['symbol']]
         if self.fail_next:
             exc, executed = self.fail_next
             self.fail_next = None
@@ -176,6 +193,7 @@ class FakeExchange:
             return resp
 
     def get_order(self, symbol, origClientOrderId):
+        self.fault('get_order')
         if origClientOrderId not in self.by_coid:
             raise api_error(-2013, 'Order does not exist.')
         r = dict(self.by_coid[origClientOrderId])
@@ -183,6 +201,7 @@ class FakeExchange:
         return r
 
     def get_my_trades(self, symbol, orderId):
+        self.fault('get_my_trades')
         return [f for r in self.by_coid.values() if r['orderId'] == orderId for f in r['fills']]
 
     def fetch_book(self, symbol):
@@ -284,8 +303,18 @@ class Planning(unittest.TestCase):
         a_back = plan.q3 * plan.p3 * (1 - f)
         dust = (plan.q1 * (1 - f) - plan.q2) * plan.p2 * (1 - f) * plan.p3 * (1 - f) + (b_got - plan.q3) * plan.p3 * (1 - f)
         self.assertAlmostEqual(float(plan.profit), float(a_back + dust - plan.q1 * plan.p1), places=9)
-        self.assertGreater(plan.pct, D('0.5'))
+        self.assertAlmostEqual(float(plan.cash_profit), float(a_back - plan.q1 * plan.p1), places=9)
+        self.assertEqual(plan.pct, plan.cash_profit / plan.spend * 100)    # gate ignores dust
+        self.assertLessEqual(plan.pct, plan.pct_with_dust)
+        self.assertGreater(plan.pct, D('0.45'))
         self.assertLess(plan.pct, D('0.7'))
+
+    def test_thin_stable_book_rejected(self):
+        books = as_levels(MISPRICED)
+        books['FDUSDUSDT']['bids'] = [(D('0.9990'), D('10'))]
+        plan, why = E.plan_route('USDT', 'FDUSD', D(100), books, rules(), fees())
+        self.assertIsNone(plan)
+        self.assertIn('FDUSDUSDT', why)
 
     def test_dust_is_small(self):
         plan, _ = E.plan_route('USDT', 'FDUSD', D(100), as_levels(MISPRICED), rules(), fees())
@@ -322,7 +351,8 @@ class Execution(unittest.TestCase):
         self.assertEqual(res.outcome, 'DONE', res.notes)
         self.assertEqual([o['symbol'] for o in self.fake.orders], ['SOLUSDT', 'SOLFDUSD', 'FDUSDUSDT'])
         self.assertEqual(self.fake.orders[0]['timeInForce'], 'FOK')
-        self.assertAlmostEqual(float(res.pnl), float(self.plan.profit), places=6)
+        self.assertAlmostEqual(float(res.pnl), float(self.plan.profit), delta=0.01)
+        self.assertGreaterEqual(res.a_received - res.a_spent, self.plan.cash_profit)
         # the account really gained what we say it did
         self.assertEqual(self.fake.bal['USDT'] - self.start['USDT'], res.a_received - res.a_spent)
         self.assertGreater(self.fake.bal['USDT'], self.start['USDT'])
@@ -360,7 +390,7 @@ class Execution(unittest.TestCase):
         res = self.run_plan()
         self.assertEqual(res.outcome, 'DONE', res.notes)
         self.assertEqual(len(self.fake.orders), 3)      # leg 1 was looked up, not sent twice
-        self.assertAlmostEqual(float(res.pnl), float(self.plan.profit), places=6)
+        self.assertAlmostEqual(float(res.pnl), float(self.plan.profit), delta=0.01)
 
     def test_order_never_arrived_is_unknown(self):
         self.fake.fail_next = (requests.exceptions.ConnectionError('reset'), False)
@@ -401,6 +431,7 @@ class Execution(unittest.TestCase):
         res = self.run_plan()
         self.assertEqual(res.outcome, 'HOLDING_SOL')
         self.assertGreater(res.sol_left, D('0.8'))
+        self.assertLess(res.pnl, D('-10'))     # valued at today's crashed price, not the plan
         # nothing was dumped at the crashed price
         self.assertFalse(any(D(o['price']) < D('118') for o in self.fake.orders if o['side'] == 'SELL'))
 
@@ -412,7 +443,66 @@ class Execution(unittest.TestCase):
         res = self.run_plan()
         self.assertEqual(res.outcome, 'HOLDING_FDUSD')
         self.assertGreater(res.b_left, D('99'))
+        self.assertLess(res.pnl, self.plan.profit - D('0.5'))   # FDUSD valued at the lower price
         self.assertEqual(sum(1 for o in self.fake.orders if o['symbol'] == 'FDUSDUSDT'), 2)
+
+
+    def test_lookup_rate_limited_after_fill_is_unknown(self):
+        self.fake.fail_next = (requests.exceptions.ReadTimeout('timed out'), True)
+        self.fake.faults['get_order'] = [api_error(-1003, 'Too many requests', status=429)] * 10
+        res = self.run_plan()
+        self.assertEqual(res.outcome, 'UNKNOWN')      # not REJECTED: the buy really happened
+        self.assertEqual(len(self.fake.orders), 1)
+
+    def test_trades_lookup_failing_is_unknown(self):
+        self.fake.fail_next = (requests.exceptions.ReadTimeout('timed out'), True)
+        self.fake.faults['get_my_trades'] = [requests.exceptions.ReadTimeout('timed out')] * 10
+        res = self.run_plan()
+        self.assertEqual(res.outcome, 'UNKNOWN')
+
+    def test_lost_leg2_response_is_reconciled(self):
+        def lose_leg2(p):
+            if p['symbol'] == 'SOLFDUSD':
+                self.fake.fail_next = (requests.exceptions.ReadTimeout('timed out'), True)
+        self.fake.before_order = lose_leg2
+        res = self.run_plan()
+        self.assertEqual(res.outcome, 'DONE', res.notes)
+        self.assertEqual(len(self.fake.orders), 3)
+
+    def test_book_errors_during_leg2_still_unwind(self):
+        def drain(p):
+            if p['symbol'] == 'SOLFDUSD':
+                self.fake.books['SOLFDUSD']['bids'] = [[D('120.00'), D('0.3')], [D('110.00'), D('100')]]
+                self.fake.faults['get_order_book'] = [requests.exceptions.ConnectionError('reset')] * 100
+        self.fake.before_order = drain
+        res = self.run_plan()
+        self.assertNotEqual(res.outcome, 'UNKNOWN', res.notes)
+        self.assertTrue(any(o['symbol'] == 'SOLUSDT' and o['side'] == 'SELL' for o in self.fake.orders))
+        self.assertLess(res.sol_left, D('0.001'))
+
+    def test_leg2_rejected_sells_sol_back(self):
+        self.fake.reject['SOLFDUSD'] = api_error(-2010, 'This symbol is not permitted for this account.')
+        res = self.run_plan()
+        self.assertEqual(res.outcome, 'LEG_REJECTED')
+        self.assertTrue(any(o['symbol'] == 'SOLUSDT' and o['side'] == 'SELL' for o in self.fake.orders))
+        self.assertLess(res.sol_left, D('0.001'))
+        self.assertGreater(res.pnl, D('-0.6'))     # bounded by the unwind loss cap and fees
+
+    def test_buy_side_leg3(self):
+        fake = FakeExchange(MISPRICED_USDT)
+        plan, why = E.plan_route('FDUSD', 'USDT', D(100), as_levels(MISPRICED_USDT), self.rules, self.fees,
+                                 cushion=E.DEPTH_CUSHION)
+        self.assertIsNone(why)
+        self.assertEqual((plan.stable, plan.side3), ('FDUSDUSDT', 'BUY'))
+        start = dict(fake.bal)
+        res = E.execute(fake, plan, self.rules, self.fees, fake.fetch_book, leg2_wait=0.3)
+        self.assertEqual(res.outcome, 'DONE', res.notes)
+        o3 = fake.orders[2]
+        self.assertEqual((o3['symbol'], o3['side']), ('FDUSDUSDT', 'BUY'))
+        self.assertRegex(o3['quantity'], r'^\d+$')
+        self.assertEqual(fake.bal['FDUSD'] - start['FDUSD'], res.a_received - res.a_spent)
+        self.assertGreater(fake.bal['FDUSD'], start['FDUSD'])
+        self.assertAlmostEqual(float(res.pnl), float(plan.profit), delta=0.01)
 
 
 class PaperFill(unittest.TestCase):
@@ -424,6 +514,14 @@ class PaperFill(unittest.TestCase):
         outcome, pnl = E.paper_fill(self.plan, as_levels(MISPRICED), self.rules, self.fees)
         self.assertEqual(outcome, 'DONE')
         self.assertAlmostEqual(float(pnl), float(self.plan.profit), delta=0.02)
+
+    def test_crash_after_plan_shows_the_loss(self):
+        crashed = as_levels(MISPRICED)
+        crashed['SOLFDUSD']['bids'] = [(D('100.00'), D('100'))]
+        crashed['SOLUSDT']['bids'] = [(D('100.00'), D('100'))]
+        outcome, pnl = E.paper_fill(self.plan, crashed, self.rules, self.fees)
+        self.assertEqual(outcome, 'HOLDING_SOL')
+        self.assertLess(pnl, D('-10'))
 
     def test_moved_market(self):
         moved = make_books({'USDT': '119.50', 'FDUSD': '120.00', 'USDC': '118.80'})
@@ -499,6 +597,56 @@ class EngineLoop(unittest.TestCase):
         eng, ev = run_engine(fake, dry_run=True, cooldown=0, max_trades=2)
         self.assertEqual(len(of(ev, 'trade')), 2)
         self.assertIn('2 trades', of(ev, 'stopped')[0])
+
+    def test_holding_stablecoin_stops_the_session(self):
+        fake = FakeExchange(MISPRICED)
+        def drop(p):
+            if p['symbol'] == 'FDUSDUSDT':
+                fake.books['FDUSDUSDT']['bids'] = [[D('0.9800'), D('1000000')]]
+        fake.before_order = drop
+        eng, ev = run_engine(fake, dry_run=False, cooldown=0)
+        self.assertEqual(len(of(ev, 'trade')), 1)
+        self.assertIn('HOLDING_FDUSD', of(ev, 'stopped')[0])
+
+    def test_unknown_order_stops_the_session(self):
+        fake = FakeExchange(MISPRICED)
+        fake.fail_next = (requests.exceptions.ConnectionError('reset'), False)
+        eng, ev = run_engine(fake, dry_run=False, cooldown=0)
+        self.assertIn('UNKNOWN', of(ev, 'stopped')[0])
+        self.assertEqual(len(fake.orders), 1)
+        self.assertIsNone(of(ev, 'trade')[0]['pnl'])
+
+    def test_bad_key_on_order_stops_the_session(self):
+        fake = FakeExchange(MISPRICED)
+        fake.reject['SOLUSDT'] = api_error(-2015, 'Invalid API-key, IP, or permissions for action.', 401)
+        fake.reject['SOLUSDC'] = fake.reject['SOLUSDT']
+        eng, ev = run_engine(fake, dry_run=False, cooldown=0)
+        self.assertEqual(len(fake.orders), 1)
+        self.assertIn('refused', of(ev, 'stopped')[0])
+
+    def test_no_live_trades_without_real_fees(self):
+        fake = FakeExchange(MISPRICED)
+        fake.commission_error = api_error(-2015, 'Invalid API-key, IP, or permissions for action.', 401)
+        eng, ev = run_engine(fake, dry_run=False)
+        self.assertEqual(fake.orders, [])
+        self.assertEqual(eng.fees.source, 'fallback')
+        self.assertTrue(any('real fees' in d[1] for d in of(ev, 'log')))
+
+    def test_missing_commission_block_is_not_zero_fee(self):
+        class C:
+            def _get(self, path, signed, data):
+                return {'taxCommission': {'taker': '0', 'buyer': '0', 'seller': '0'}}
+        f = fees()
+        with self.assertRaises(KeyError):
+            f.load_from_account(C())
+        self.assertEqual(f.source, 'fallback')
+
+    def test_trade_event_carries_updated_stats(self):
+        fake = FakeExchange(MISPRICED)
+        eng, ev = run_engine(fake, dry_run=False)
+        tr = of(ev, 'trade')[0]
+        self.assertEqual(tr['stats']['trades'], 1)
+        self.assertAlmostEqual(tr['stats']['pnl'], tr['pnl'])
 
     def test_loss_limit_stops_the_session(self):
         eng = E.Engine(dict(E.DEFAULTS), lambda k, d: None, threading.Event())

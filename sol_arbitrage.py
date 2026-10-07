@@ -6,6 +6,7 @@ Without keys it runs on public market data in dry run (paper trading) mode.
 """
 import math
 import queue
+import sys
 import threading
 import time
 import tkinter as tk
@@ -69,17 +70,25 @@ class App:
         self.history = []
         self.logfile = open('log.txt', 'a', encoding='utf-8')
         self.min_profit = E.DEFAULTS['min_profit']
-        self.fees = {}   # symbol -> (buy, sell) taker rate, when read from the account
+        self.fees = {}   # symbol -> (buy, sell) taker rate the engine is using
+        self.thread = None
+        self.closing = False
+        self.last_tick = 0.0
+        self.interval = E.DEFAULTS['interval']
+        self.halt_reason = None
 
         root.title('SOL Arbitrage')
         root.configure(bg=BG)
-        root.geometry('1240x860')
-        root.minsize(1080, 760)
+        height = max(640, min(860, root.winfo_screenheight() - 80))
+        root.geometry(f'1240x{height}')
+        root.minsize(1000, 640)
         self.ui = pick_font('Segoe UI', 'SF Pro Text', 'Helvetica Neue', 'DejaVu Sans', 'Arial')
         self.mono = pick_font('Cascadia Mono', 'Consolas', 'Menlo', 'DejaVu Sans Mono', 'Courier New')
         self.style()
 
         self.build_header()
+        self.banner = tk.Label(root, text='', bg='#3d1214', fg='#ffb4ae', font=(self.ui, 10, 'bold'),
+                               anchor='w', padx=14, pady=8, wraplength=1150, justify='left')
         self.build_cards()
         body = tk.Frame(root, bg=BG)
         body.pack(fill='both', expand=True, padx=16, pady=(0, 16))
@@ -127,9 +136,12 @@ class App:
         s.configure('Link.TButton', background=PANEL, foreground=MUTED, borderwidth=0, padding=(0, 2),
                     font=(self.ui, 9, 'underline'))
         s.map('Link.TButton', background=[('active', PANEL)], foreground=[('active', TEXT)])
-        s.configure('TRadiobutton', background=PANEL, foreground=TEXT, indicatorcolor=FIELD,
-                    font=(self.ui, 10))
-        s.map('TRadiobutton', background=[('active', PANEL)], indicatorcolor=[('selected', PURPLE)])
+        s.configure('TRadiobutton', background=PANEL, foreground=TEXT, indicatorbackground=FIELD,
+                    indicatorforeground=PURPLE, upperbordercolor=BORDER, lowerbordercolor=BORDER,
+                    indicatormargin=(0, 0, 8, 0), font=(self.ui, 10))
+        s.map('TRadiobutton', background=[('active', PANEL)],
+              indicatorbackground=[('disabled', PANEL), ('pressed', PANEL)],
+              indicatorforeground=[('disabled', DIM)], foreground=[('disabled', MUTED)])
         s.configure('TNotebook', background=BG, borderwidth=1, tabmargins=0, bordercolor=BORDER,
                     lightcolor=BORDER, darkcolor=BORDER)
         s.configure('TNotebook.Tab', background=BG, foreground=MUTED, padding=(14, 6), borderwidth=1,
@@ -159,7 +171,7 @@ class App:
 
     # ------------------------------------------------------------------ layout
     def build_header(self):
-        h = tk.Frame(self.root, bg=BG)
+        h = self.header = tk.Frame(self.root, bg=BG)
         h.pack(fill='x', padx=16, pady=(14, 10))
         logo = tk.Canvas(h, width=34, height=34, bg=BG, highlightthickness=0)
         logo.pack(side='left')
@@ -251,11 +263,14 @@ class App:
         grid = tk.Frame(c, bg=PANEL)
         grid.pack(fill='x', padx=14, pady=(8, 12))
         grid.columnconfigure(1, weight=1)
+        grid.columnconfigure(3, weight=1)
         self.bal = {}
-        for i, a in enumerate(E.ASSETS):
-            tk.Label(grid, text=a, bg=PANEL, fg=MUTED, font=(self.ui, 10)).grid(row=i, column=0, sticky='w')
-            v = tk.Label(grid, text='—', bg=PANEL, fg=TEXT, font=(self.mono, 10))
-            v.grid(row=i, column=1, sticky='e')
+        for i, a in enumerate(E.ASSETS):   # two columns to save height
+            row, col = i // 2, (i % 2) * 2
+            tk.Label(grid, text=a, bg=PANEL, fg=MUTED, font=(self.ui, 9)).grid(
+                row=row, column=col, sticky='w', padx=(0 if col == 0 else 14, 6))
+            v = tk.Label(grid, text='—', bg=PANEL, fg=TEXT, font=(self.mono, 9))
+            v.grid(row=row, column=col + 1, sticky='e')
             self.bal[a] = v
 
     def table(self, parent, cols, height):
@@ -332,8 +347,8 @@ class App:
                 s[k] = float(self.vars[k].get())
             except ValueError:
                 raise ValueError(f'"{label}" must be a number')
-            if s[k] < 0:
-                raise ValueError(f'"{label}" cannot be negative')
+            if not math.isfinite(s[k]) or s[k] < 0:
+                raise ValueError(f'"{label}" must be a positive number')
         if s['size'] < 20:
             raise ValueError('Trade size should be at least 20: Binance needs 5 per order and the '
                              'stablecoin pair only trades whole units')
@@ -341,6 +356,10 @@ class App:
             raise ValueError('Check every should be at least 0.5 s (Binance rate limits)')
         if s['min_profit'] < 0.05:
             raise ValueError('Min profit below 0.05% leaves no room for price movement between orders')
+        if s['max_trades'] < 1 or s['max_trades'] != int(s['max_trades']):
+            raise ValueError('"Max trades" must be a whole number of at least 1')
+        if s['max_loss'] <= 0:
+            raise ValueError('"Stop at loss" must be more than 0')
         s['max_trades'] = int(s['max_trades'])
         s['dry_run'] = self.dry_run.get()
         return s
@@ -350,6 +369,11 @@ class App:
             s = self.read_settings()
         except ValueError as e:
             messagebox.showerror('Settings', str(e))
+            return
+        if not s['dry_run'] and self.halt_reason and not messagebox.askyesno(
+                'Last session was halted',
+                f'The last session stopped because:\n\n{self.halt_reason}\n\n'
+                'Have you checked your Binance balances and open orders?', icon='warning'):
             return
         if not s['dry_run'] and not messagebox.askyesno(
                 'Start live trading?',
@@ -364,11 +388,16 @@ class App:
         self.set_card('pnl', '$0.00', 'paper trading' if s['dry_run'] else 'live trading')
         self.set_card('trades', '0', 'none yet')
         self.history = []
+        self.interval = s['interval']
+        self.halt_reason = None
+        self.banner.pack_forget()
         self.stop_event = threading.Event()
         engine = E.Engine(s, lambda k, d: self.events.put((k, d)), self.stop_event,
                           api_key=getattr(key, 'api_key', None), api_secret=getattr(key, 'api_secret', None),
                           market_data_url=getattr(key, 'market_data_url', None))
-        threading.Thread(target=engine.run, daemon=True).start()
+        # not a daemon: closing the window lets a trade in progress finish its legs
+        self.thread = threading.Thread(target=engine.run, daemon=False)
+        self.thread.start()
         self.running = True
         self.set_running(True)
         self.log(f'Started in {"DRY RUN" if s["dry_run"] else "LIVE"} mode: size {s["size"]:g}, '
@@ -388,9 +417,17 @@ class App:
         self.set_pill(self.p_state, '● RUNNING' if on else '○ STOPPED', GREEN if on else MUTED)
 
     def close(self):
+        if self.running and not self.dry_run.get() and not messagebox.askyesno(
+                'Quit?', 'Live trading is running. A trade in progress will finish first. Quit?'):
+            return
         if self.stop_event:
             self.stop_event.set()
-        self.root.destroy()
+        if self.thread and self.thread.is_alive():
+            self.closing = time.monotonic()
+            self.root.title('SOL Arbitrage (stopping…)')
+            self.log('Closing: waiting for the engine to finish…', 'info')
+        else:
+            self.root.destroy()
 
     def log(self, text, level='info'):
         stamp = time.strftime('%H:%M:%S')
@@ -401,17 +438,30 @@ class App:
             self.log_box.delete('1.0', '500.0')
         self.log_box.see('end')
         self.log_box.configure(state='disabled')
-        self.logfile.write(f'{time.strftime("%Y-%m-%d")} {stamp} [{level}] {text}\n')
-        self.logfile.flush()
+        try:
+            self.logfile.write(f'{time.strftime("%Y-%m-%d")} {stamp} [{level}] {text}\n')
+            self.logfile.flush()
+        except OSError:
+            pass
 
     # ------------------------------------------------------------------ engine events
     def poll(self):
         try:
             for _ in range(200):
                 kind, data = self.events.get_nowait()
-                getattr(self, 'on_' + kind)(data)
+                try:
+                    getattr(self, 'on_' + kind)(data)
+                except Exception as e:   # a display bug must never freeze the window
+                    print(f'UI error handling {kind}: {e!r}', file=sys.stderr)
         except queue.Empty:
             pass
+        if self.closing and (not self.thread.is_alive() or time.monotonic() - self.closing > 30):
+            self.root.destroy()
+            return
+        if self.running and self.last_tick and time.monotonic() - self.last_tick > max(5, 4 * self.interval):
+            age = time.monotonic() - self.last_tick
+            self.set_pill(self.p_data, f'NO DATA {age:.0f}s', RED)
+            self.set_card('best', '—', 'no live prices', DIM)
         self.root.after(100, self.poll)
 
     def on_log(self, data):
@@ -430,15 +480,17 @@ class App:
             self.set_pill(self.p_fees, f'FEES: FALLBACK {self.vars["fallback_fee"].get()}%', AMBER)
 
     def on_fees(self, data):
-        self.fees = data['rates'] if data['source'] == 'account' else {}
+        self.fees = data['rates']
         self.set_fees_pill(data['source'])
 
     def on_balances(self, bal):
         for a, w in self.bal.items():
             v = bal.get(a)
             w.configure(text='—' if v is None else f'{v:,.4f}' if a in ('SOL', 'BNB') else f'{v:,.2f}')
+            w.configure(fg=TEXT if v else DIM)
 
     def on_tick(self, t):
+        self.last_tick = time.monotonic()
         st = t['stats']
         lat = t['latency']
         self.set_pill(self.p_data, f'{time.strftime("%H:%M:%S")} · {lat:.0f} ms', GREEN if lat < 500 else AMBER)
@@ -487,12 +539,14 @@ class App:
         cd = t['cooldown']
         self.set_card('checks', f'{st["checks"]:,}',
                       f'cooling down {math.ceil(cd)}s' if cd > 0.05 else f'{st["candidates"]} re-checked on depth')
-        dry = self.dry_run.get()
+        self.update_stats(st)
+
+    def update_stats(self, st):
         self.set_card('trades', str(st['trades']),
                       f'{st["wins"]} profitable · {st["losses"]} losing' if st['trades'] else 'none yet')
         pnl = st['pnl']
         self.set_card('pnl', f'{"-" if pnl < 0 else ""}${abs(pnl):,.4f}',
-                      'paper trading' if dry else 'live trading',
+                      'paper trading' if self.dry_run.get() else 'live trading',
                       GREEN if pnl > 0 else RED if pnl < 0 else TEXT)
 
     def meter(self, pct, low=-0.5):
@@ -504,10 +558,12 @@ class App:
         return '▰' * n + '▱' * (10 - n) + ('   GO' if gap <= 0 else f'   {gap:.3f}% to go')
 
     def on_trade(self, tr):
-        tag = 'go' if tr['pnl'] > 0 else 'bad' if tr['pnl'] < 0 else 'muted'
+        pnl = tr['pnl']
+        tag = 'bad' if pnl is None or pnl < 0 else 'go' if pnl > 0 else 'muted'
         self.trades.insert('', 0, values=(tr['time'], tr['route'], 'LIVE' if tr['live'] else 'paper',
                                           f'{tr["planned"]:+.3f}%', tr['outcome'],
-                                          f'{tr["pnl"]:+.4f} {tr["asset"]}'), tags=(tag,))
+                                          'unknown' if pnl is None else f'{pnl:+.4f} {tr["asset"]}'), tags=(tag,))
+        self.update_stats(tr['stats'])
         self.nb.select(self.trades_tab)
         self.root.bell()
 
@@ -517,9 +573,14 @@ class App:
     def on_stopped(self, reason):
         self.running = False
         self.set_running(False)
+        self.set_pill(self.p_data, 'NO DATA', DIM)
         if reason:
-            self.set_pill(self.p_state, '■ HALTED', RED)
             if not self.dry_run.get():
+                self.halt_reason = reason
+            self.set_pill(self.p_state, '■ HALTED', RED)
+            self.banner.configure(text='■ Stopped: ' + reason)
+            self.banner.pack(after=self.header, fill='x', padx=16, pady=(0, 10))
+            if not self.dry_run.get() and not self.closing:
                 messagebox.showwarning('Trading stopped', reason)
         self.log('Stopped.', 'info')
 
