@@ -12,8 +12,7 @@ from .market import BPS, D
 
 MODES = ("paper", "testnet", "live")
 
-# Fiat + two stablecoins, like the original UAH/USDT/BUSD idea (all UAH and
-# BUSD markets on Binance are suspended now), plus a few stablecoin-only ones.
+# Fiat + two stablecoins, plus a few stablecoin-only triangles.
 DEFAULT_TRIANGLES = [
     ["USDT", "USDC", "TRY"],
     ["USDT", "FDUSD", "TRY"],

@@ -1,22 +1,16 @@
 # USDUAH-Arbitrage
 
-Triangular arbitrage on Binance spot.
+Arbitrage on Binance spot. The repo has two separate tools:
 
-- `BUSD USDT Oppertunity.py` + `key.py`: the original 2023 script, kept as it was.
-- `arbitrage_bot/`: a rewrite that is meant to actually work, with a paper-trading **test mode**.
+- `arbitrage_bot/`: a triangular-arbitrage bot (described below). It has a paper-trading
+  **test mode**, risk limits and a live browser dashboard.
+- `sol_arbitrage.py`: a single-script SOL arbitrage across USDT/FDUSD/USDC with a Tkinter
+  window. It reads its API keys from `key.py`; `arbitrage_bot` doesn't use `key.py` at all.
 
-## Why the original can't work any more
+If a configured market has been suspended on Binance (status `BREAK`), the bot says so at
+startup and skips that triangle.
 
-1. **Its markets are gone.** Binance has suspended every UAH pair (`USDTUAH`, `BUSDUAH`, …) and
-   `BUSDUSDT`. They all report status `BREAK`. The new bot checks this at startup and tells you.
-2. **The signal didn't match the trades.** It compared `USDTUAH ask − BUSDUAH bid`, but the trades
-   it then placed bought at the BUSD *ask* and sold USDT at the *bid*. The `BUSDUSDT` leg and
-   trading fees (about 0.1% per leg, so about 0.3% per cycle) were never included in the check.
-3. **Order sizes didn't chain.** Every leg used a fixed `quantity=100` in base units, regardless
-   of what the previous leg actually produced, so balances drifted or orders failed.
-4. **No error handling.** A failed leg left a half-done position, and any API error crashed the loop.
-
-## What the rewrite does
+## What the bot does
 
 Every `poll_interval_sec` it:
 

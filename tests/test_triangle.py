@@ -26,14 +26,14 @@ def test_build_cycles_picks_side_from_symbol_orientation():
 
 
 def test_suspended_markets_are_reported():
-    # The original bot's triangle: all three markets are in BREAK on Binance today.
+    # BUSD markets are in BREAK on Binance today.
     index = PairIndex([
-        make_rules("USDTUAH", "USDT", "UAH", status="BREAK"),
-        make_rules("BUSDUAH", "BUSD", "UAH", status="BREAK"),
+        make_rules("USDCUSDT", "USDC", "USDT"),
+        make_rules("BUSDUSDC", "BUSD", "USDC", status="BREAK"),
         make_rules("BUSDUSDT", "BUSD", "USDT", status="BREAK"),
     ])
-    with pytest.raises(MissingMarketError, match="USDTUAH exists but its status is BREAK"):
-        build_cycles("UAH", ["UAH", "USDT", "BUSD"], index)
+    with pytest.raises(MissingMarketError, match="BUSDUSDT exists but its status is BREAK"):
+        build_cycles("USDT", ["USDT", "USDC", "BUSD"], index)
     with pytest.raises(ValueError):
         build_cycles("USDT", ["USDC", "EUR", "BRL"], index)
 
